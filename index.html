@@ -1020,7 +1020,7 @@ const GH_FILE   = 'data.json'; // ← Tên file dữ liệu
 // Nếu để 'YOUR_WORKER_URL', bệnh nhân dùng trình duyệt khác sẽ KHÔNG đặt lịch được!
 // Lý do: Worker URL trong ⚙️ Cài đặt chỉ lưu trong localStorage của trình duyệt admin,
 // không chia sẻ được sang trình duyệt của bệnh nhân. Hằng số này là cách duy nhất.
-const WORKER_URL = 'https://pkbsdat.trangchanhnguyenst97.workers.dev/'; // ← ĐỔI THÀNH URL THẬT: vd 'https://pk-booking.tenban.workers.dev'
+const WORKER_URL = 'YOUR_WORKER_URL'; // ← ĐỔI THÀNH URL THẬT: vd 'https://pk-booking.tenban.workers.dev'
 
 // ── STORAGE KEYS ─────────────────────────────────────
 const BK = 'pk_bk5';   // bookings
@@ -1104,6 +1104,22 @@ async function ghFetchData(){
   const c=ghCfgResolved();
   if(!c.owner||!c.repo) return null;
   try{
+    // ── Khi có token: dùng GitHub API (không bị CDN cache) → luôn lấy dữ liệu mới nhất ──
+    if(c.token){
+      const r=await fetch(
+        `https://api.github.com/repos/${c.owner}/${c.repo}/contents/${c.file}?ref=${c.branch}`,
+        {headers:{'Authorization':`Bearer ${c.token}`,'Accept':'application/vnd.github.v3+json'}}
+      );
+      if(!r.ok) return null;
+      const d=await r.json();
+      const raw=new TextDecoder().decode(
+        Uint8Array.from(atob(d.content.replace(/\n/g,'')),ch=>ch.charCodeAt(0))
+      );
+      return JSON.parse(raw);
+    }
+    // ── Fallback (bệnh nhân không có token): raw URL ──
+    // raw.githubusercontent.com có thể trễ cache vài phút, nhưng bệnh nhân
+    // chỉ cần đọc slot hiển thị; Worker validate thực tế phía server.
     const url=`https://raw.githubusercontent.com/${c.owner}/${c.repo}/${c.branch}/${c.file}?_=${Date.now()}`;
     const r=await fetch(url);
     if(!r.ok) return null;
@@ -1297,6 +1313,11 @@ async function initFromGH(){
     renderGallery();
     updateProfileDisplay();
     renderSlots();
+    // Nếu admin panel đang mở → cập nhật lại tab hiện tại để hiển thị booking mới
+    const ap=document.getElementById('admin-panel');
+    if(isAdmin && ap && !ap.classList.contains('hidden')){
+      switchTab(curTab, null);
+    }
   }
 }
 
@@ -1541,7 +1562,21 @@ document.querySelector('.nb-brand').addEventListener('click',()=>{
 });
 if(isAdmin)document.getElementById('admin-badge').classList.remove('hidden');
 
-function openAdminPanel(){switchTab(curTab,null);document.getElementById('admin-panel').classList.remove('hidden');}
+function openAdminPanel(){
+  switchTab(curTab,null);
+  document.getElementById('admin-panel').classList.remove('hidden');
+  // Tải dữ liệu mới nhất từ GitHub ngay khi mở panel (không đợi auto-refresh 15s)
+  (async()=>{
+    const data=await ghFetchData();
+    if(data&&data.bookings){
+      const before=JSON.stringify(loadBK());
+      applyGHBookingsOnly(data.bookings);
+      renderSlots();
+      // Chỉ re-render panel nếu có booking mới (tránh nhấp nháy không cần thiết)
+      if(JSON.stringify(loadBK())!==before) switchTab(curTab,null);
+    }
+  })();
+}
 window.closeAdminPanel=function(){document.getElementById('admin-panel').classList.add('hidden');};
 
 // ── SHARED SYNC STATUS ────────────────────────────────
@@ -1995,19 +2030,24 @@ window.apChangePw=async function(){
 renderDates();renderSlots();renderGallery();updateProfileDisplay();applyContentToPage();
 initFromGH();
 
-// ── AUTO-REFRESH — cập nhật slot mỗi 30s (hiển thị booking mới từ bệnh nhân) ──
+// ── AUTO-REFRESH — cập nhật slot mỗi 15s (hiển thị booking mới từ bệnh nhân) ──
 setInterval(async()=>{
   const data=await ghFetchData();
   if(data&&data.bookings){
     const before=JSON.stringify(loadBK());
     applyGHBookingsOnly(data.bookings);
     renderSlots();
-    // Nếu có booking mới từ bệnh nhân → refresh tab Lịch đặt nếu admin đang xem
-    if(isAdmin&&JSON.stringify(loadBK())!==before&&curTab==='bookings'){
-      switchTab('bookings',null);
+    // Nếu admin đang xem tab bookings → luôn refresh (dù có thay đổi hay không)
+    // để đảm bảo hiển thị đồng bộ với GitHub
+    if(isAdmin&&curTab==='bookings'){
+      const ap=document.getElementById('admin-panel');
+      if(ap&&!ap.classList.contains('hidden')){
+        // Chỉ re-render nếu có thay đổi (tránh nhấp nháy liên tục)
+        if(JSON.stringify(loadBK())!==before) switchTab('bookings',null);
+      }
     }
   }
-},30000);
+},15000);
 </script>
 
 <!-- ADMIN BADGE -->
