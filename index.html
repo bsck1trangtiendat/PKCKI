@@ -1260,13 +1260,17 @@ function applyGHData(ghData){
   // ── Admin data (ảnh, gallery) ──
   if(ghData.adminData && typeof ghData.adminData==='object'){
     const local=loadAD();
-    const merged=Object.assign({},ghData.adminData,{gallery:ghData.adminData.gallery||local.gallery||[]});
+    // ⚠️ FIX: Bảo vệ ảnh local nếu GH không có (push thất bại do ảnh quá lớn)
+    const merged=Object.assign({},ghData.adminData);
+    if(!merged.profilePhoto && local.profilePhoto) merged.profilePhoto=local.profilePhoto;
+    if((!merged.gallery||!merged.gallery.length) && local.gallery && local.gallery.length) merged.gallery=local.gallery;
     saveAD(merged);
   }
 
   // ── Nội dung trang ──
   if(ghData.content && typeof ghData.content==='object'){
-    saveCT(ghData.content);
+    // ⚠️ FIX: Merge GH content vào local (không ghi đè hoàn toàn → tránh mất nội dung chưa sync)
+    saveCT(Object.assign({},loadCT(),ghData.content));
   }
 
   // ── Mật khẩu admin: GH là nguồn sự thật ──
@@ -1764,7 +1768,7 @@ window.switchTab=function(tab,btn){
 
         <div class="gh-field">
           <label class="gh-label">🌐 Cloudflare Worker URL — để bệnh nhân đặt lịch không cần PAT</label>
-          <input class="gh-input" id="wk-url" type="url" placeholder="https://pk-booking.username.workers.dev" value="${localStorage.getItem(WK)||WORKER_URL!=='YOUR_WORKER_URL'?WORKER_URL:''}">
+          <input class="gh-input" id="wk-url" type="url" placeholder="https://pk-booking.username.workers.dev" value="${localStorage.getItem(WK)||(WORKER_URL!=='YOUR_WORKER_URL'?WORKER_URL:'')}">
           <span style="font-size:10px;color:var(--ts);margin-top:3px;display:block">
             Bắt buộc để bệnh nhân đặt lịch được lưu lên GitHub. Xem hướng dẫn deploy <strong>worker.js</strong> bên dưới.
           </span>
@@ -1909,6 +1913,8 @@ window.ghSaveWorker=function(){
   const sb=document.getElementById('wk-status-box');
   if(!url){sb.className='gh-status err';sb.textContent='❌ Vui lòng nhập URL Worker.';sb.style.display='block';return;}
   if(!url.startsWith('https://')){sb.className='gh-status err';sb.textContent='❌ URL phải bắt đầu bằng https://';sb.style.display='block';return;}
+  // ⚠️ FIX: Không cho lưu placeholder 'YOUR_WORKER_URL' vào storage
+  if(url==='YOUR_WORKER_URL'){sb.className='gh-status err';sb.textContent='❌ Đây là placeholder, hãy nhập URL Worker thật của bạn!';sb.style.display='block';return;}
   localStorage.setItem(WK,url);
   sb.className='gh-status ok';sb.textContent=`✅ Đã lưu! Worker: ${url}`;sb.style.display='block';
 };
