@@ -1016,7 +1016,11 @@ const GH_FILE   = 'data.json'; // ← Tên file dữ liệu
 // Điền URL sau khi deploy worker.js lên Cloudflare (free)
 // Hoặc cấu hình trong ⚙️ Cài đặt của admin panel
 // ══════════════════════════════════════════════════════
-const WORKER_URL = 'YOUR_WORKER_URL'; // ← Dán URL worker vào đây (vd: https://pk-booking.username.workers.dev)
+// ⚠️ QUAN TRỌNG: Phải điền URL Cloudflare Worker THẬT vào đây rồi upload lại lên GitHub.
+// Nếu để 'YOUR_WORKER_URL', bệnh nhân dùng trình duyệt khác sẽ KHÔNG đặt lịch được!
+// Lý do: Worker URL trong ⚙️ Cài đặt chỉ lưu trong localStorage của trình duyệt admin,
+// không chia sẻ được sang trình duyệt của bệnh nhân. Hằng số này là cách duy nhất.
+const WORKER_URL = 'https://pkbsdat.trangchanhnguyenst97.worker.dev/'; // ← ĐỔI THÀNH URL THẬT: vd 'https://pk-booking.tenban.workers.dev'
 
 // ── STORAGE KEYS ─────────────────────────────────────
 const BK = 'pk_bk5';   // bookings
