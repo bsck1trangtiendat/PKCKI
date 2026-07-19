@@ -1,18 +1,5 @@
 {
-  "bookings": {
-    "2026-07-19": {
-      "09:30": [
-        {
-          "name": "A",
-          "phone": "689",
-          "note": "Tay",
-          "id": "01zw72rcimrqh6hzh",
-          "at": "2026-07-18T14:41:50.477Z",
-          "status": "declined"
-        }
-      ]
-    }
-  },
+  "bookings": {},
   "adminData": {
     "gallery": [
       {
@@ -32,5 +19,5 @@
   },
   "content": {},
   "adminHash": "e9a00e757aa57cda03a996d3988b48db34bf3f05f8ae4d897dcba3f096e7026e",
-  "updatedAt": "2026-07-19T01:19:17.544Z"
+  "updatedAt": "2026-07-19T06:47:48.593Z"
 }
