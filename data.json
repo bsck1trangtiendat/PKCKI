@@ -1,20 +1,7 @@
 {
-  "bookings": {
-    "2026-07-20": {
-      "17:30": [
-        {
-          "id": "21ve657ygmrsn56zc",
-          "name": "test 20.7",
-          "phone": "2035",
-          "note": "shock",
-          "at": "2026-07-20T03:04:19.608Z",
-          "status": "declined"
-        }
-      ]
-    }
-  },
+  "bookings": {},
   "adminData": {},
   "content": {},
   "adminHash": "e9a00e757aa57cda03a996d3988b48db34bf3f05f8ae4d897dcba3f096e7026e",
-  "updatedAt": "2026-07-20T03:05:05.531Z"
+  "updatedAt": "2026-07-20T03:07:35.884Z"
 }
