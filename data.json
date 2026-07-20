@@ -1,7 +1,20 @@
 {
-  "bookings": {},
+  "bookings": {
+    "2026-07-20": {
+      "17:30": [
+        {
+          "id": "xvz05fmjomrswbs83",
+          "name": "test cái nữa",
+          "phone": "036725784",
+          "note": "zs",
+          "at": "2026-07-20T07:21:23.619Z",
+          "status": "pending"
+        }
+      ]
+    }
+  },
   "adminData": {},
   "content": {},
   "adminHash": "e9a00e757aa57cda03a996d3988b48db34bf3f05f8ae4d897dcba3f096e7026e",
-  "updatedAt": "2026-07-20T07:20:46.159Z"
+  "updatedAt": "2026-07-20T07:21:23.619Z"
 }
