@@ -1106,1114 +1106,570 @@ function getSlotBks(date,time){const b=loadBK();return(b[date]&&b[date][time])||
 function getPendCnt(date,time){return getSlotBks(date,time).filter(b=>b.status==='pending').length}
 function hasAccepted(date,time){return getSlotBks(date,time).some(b=>b.status==='accepted')}
 
+// ══════════════════════════════════════════════════════════════════════
+//  HTML PATCH — Dán thay thế vào index_2.html
+//  Tìm đoạn "GITHUB PERSISTENCE" và thay toàn bộ từ đó đến hết
+//  setInterval(async()=>{ ... },15000);
+//
+//  Bao gồm:
+//  1. Worker API (thay thế GitHub cho bookings)
+//  2. Admin token lưu trong sessionStorage (không lộ PAT)
+//  3. Auto-refresh nhanh (5s) dùng /slots thay vì GitHub API
+// ══════════════════════════════════════════════════════════════════════
+
 // ══════════════════════════════════════════════════════
-// GITHUB PERSISTENCE — lưu data.json vào GitHub repo
-// Cấu hình trong tab ⚙️ Cài đặt của admin panel
+// WORKER API — đọc/ghi booking qua Cloudflare KV
+// (Booking KHÔNG còn lưu trên GitHub)
 // ══════════════════════════════════════════════════════
 
-// Lấy thông tin GH: ưu tiên hằng số đã hardcode, fallback sang localStorage
-function ghCfgResolved(){
-  const cfg=loadGHCfg();
-  return {
-    owner : GH_OWNER  || cfg.owner  || '',
-    repo  : GH_REPO   || cfg.repo   || '',
-    branch: GH_BRANCH || cfg.branch || 'main',
-    file  : GH_FILE   || cfg.file   || 'data.json',
-    token : cfg.token || ''   // PAT chỉ có trong localStorage
-  };
-}
+// Lấy admin token từ sessionStorage (nhập lúc đăng nhập)
+function getAdminToken() { return sessionStorage.getItem('_atok') || ''; }
 
-async function ghFetchData(){
-  const c=ghCfgResolved();
-  if(!c.owner||!c.repo) return null;
-  try{
-    // ── Khi có token: dùng GitHub API (không bị CDN cache) → luôn lấy dữ liệu mới nhất ──
-    if(c.token){
-      const r=await fetch(
-        `https://api.github.com/repos/${c.owner}/${c.repo}/contents/${c.file}?ref=${c.branch}`,
-        {headers:{'Authorization':`Bearer ${c.token}`,'Accept':'application/vnd.github.v3+json'}}
-      );
-      if(!r.ok) return null;
-      const d=await r.json();
-      const raw=new TextDecoder().decode(
-        Uint8Array.from(atob(d.content.replace(/\n/g,'')),ch=>ch.charCodeAt(0))
-      );
-      return JSON.parse(raw);
-    }
-    // ── Fallback (bệnh nhân không có token): raw URL ──
-    // raw.githubusercontent.com có thể trễ cache vài phút, nhưng bệnh nhân
-    // chỉ cần đọc slot hiển thị; Worker validate thực tế phía server.
-    const url=`https://raw.githubusercontent.com/${c.owner}/${c.repo}/${c.branch}/${c.file}?_=${Date.now()}`;
-    const r=await fetch(url);
-    if(!r.ok) return null;
-    return await r.json();
-  }catch{return null;}
-}
-
-async function ghGetFileSha(){
-  const c=ghCfgResolved();
-  if(!c.owner||!c.repo||!c.token) return null;
-  try{
-    const r=await fetch(`https://api.github.com/repos/${c.owner}/${c.repo}/contents/${c.file}?ref=${c.branch}`,{
-      headers:{'Authorization':`Bearer ${c.token}`,'Accept':'application/vnd.github.v3+json'}
+// ── PUBLIC: Lấy trạng thái slot theo ngày (không lộ PII) ─────────────
+async function wkFetchSlots(date) {
+  const url = getWorkerUrl();
+  if (!url || url === 'YOUR_WORKER_URL') return null;
+  try {
+    const r = await fetch(`${url.replace(/\/$/, '')}/slots?date=${date}`, {
+      cache: 'no-store',
     });
-    if(!r.ok) return null;
-    const d=await r.json();
-    return d.sha||null;
-  }catch{return null;}
+    if (!r.ok) return null;
+    return await r.json(); // { "09:00": { pending: 2, accepted: false }, ... }
+  } catch { return null; }
 }
 
-async function ghPushData(payload){
-  const c=ghCfgResolved();
-  if(!c.owner||!c.repo) return {ok:false,msg:'❌ Chưa điền GH_OWNER / GH_REPO trong mã nguồn'};
-  if(!c.token) return {ok:false,msg:'❌ Chưa nhập PAT — vào ⚙️ Cài đặt → điền token'};
-  // ── Retry tối đa 3 lần khi gặp SHA conflict 409 ──────────────
-  const MAX=3;
-  for(let attempt=1;attempt<=MAX;attempt++){
-    const sha=await ghGetFileSha();
-    const content=btoa(unescape(encodeURIComponent(JSON.stringify(payload,null,2))));
-    const body={message:`Cập nhật dữ liệu phòng khám ${new Date().toLocaleString('vi-VN')}`,content,branch:c.branch};
-    if(sha) body.sha=sha;
-    try{
-      const r=await fetch(`https://api.github.com/repos/${c.owner}/${c.repo}/contents/${c.file}`,{
-        method:'PUT',
-        headers:{'Authorization':`Bearer ${c.token}`,'Accept':'application/vnd.github.v3+json','Content-Type':'application/json'},
-        body:JSON.stringify(body)
-      });
-      if(r.ok) return {ok:true,msg:'✅ Đã lưu lên GitHub thành công!'};
-      const err=await r.json().catch(()=>({}));
-      // SHA mismatch → đợi rồi retry với SHA mới
-      if(r.status===409||(err.message&&err.message.includes('SHA'))){
-        if(attempt<MAX){await new Promise(res=>setTimeout(res,400*attempt));continue;}
-        return {ok:false,msg:'❌ Xung đột dữ liệu liên tục (SHA). Vui lòng nhấn "☁ Đồng bộ ngay" sau vài giây.'};
+// ── PUBLIC: Bệnh nhân đặt lịch (gọi trực tiếp, không thay đổi) ───────
+// Hàm này giống LUỒNG 1 cũ — giữ nguyên, chỉ đổi path từ / sang /book
+async function wkBook(date, time, name, phone, note) {
+  const url = getWorkerUrl();
+  if (!url || url === 'YOUR_WORKER_URL') return { ok: false, msg: '❌ Worker chưa được cấu hình.' };
+  const r = await fetch(`${url.replace(/\/$/, '')}/book`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ date, time, name, phone, note: note || '' }),
+  });
+  return r.json().catch(() => ({ ok: false, msg: '❌ Phản hồi không hợp lệ' }));
+}
+
+// ── ADMIN: Lấy booking theo khoảng ngày ──────────────────────────────
+async function wkAdminFetchBookings(from, to) {
+  const url   = getWorkerUrl();
+  const token = getAdminToken();
+  if (!url || !token) return null;
+  try {
+    const params = from && to ? `?from=${from}&to=${to}` : '';
+    const r = await fetch(`${url.replace(/\/$/, '')}/admin/bookings${params}`, {
+      headers: { 'X-Admin-Token': token },
+      cache: 'no-store',
+    });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+
+// ── ADMIN: Lấy booking 1 ngày ─────────────────────────────────────────
+async function wkAdminFetchDate(date) {
+  const url   = getWorkerUrl();
+  const token = getAdminToken();
+  if (!url || !token) return null;
+  try {
+    const r = await fetch(`${url.replace(/\/$/, '')}/admin/bookings?date=${date}`, {
+      headers: { 'X-Admin-Token': token },
+      cache: 'no-store',
+    });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+
+// ── ADMIN: Cập nhật trạng thái ────────────────────────────────────────
+async function wkSetStatus(date, time, id, status) {
+  const url   = getWorkerUrl();
+  const token = getAdminToken();
+  if (!url || !token) return { ok: false };
+  const r = await fetch(`${url.replace(/\/$/, '')}/admin/status`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', 'X-Admin-Token': token },
+    body: JSON.stringify({ date, time, id, status }),
+  });
+  return r.json().catch(() => ({ ok: false }));
+}
+
+// ── ADMIN: Xóa booking ────────────────────────────────────────────────
+async function wkDeleteBooking(date, time, id) {
+  const url   = getWorkerUrl();
+  const token = getAdminToken();
+  if (!url || !token) return { ok: false };
+  const r = await fetch(`${url.replace(/\/$/, '')}/admin/booking`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json', 'X-Admin-Token': token },
+    body: JSON.stringify({ date, time, id }),
+  });
+  return r.json().catch(() => ({ ok: false }));
+}
+
+// ── ADMIN: Xóa booking cũ (trước ngày X) ─────────────────────────────
+async function wkClearBefore(before) {
+  const url   = getWorkerUrl();
+  const token = getAdminToken();
+  if (!url || !token) return { ok: false };
+  const r = await fetch(`${url.replace(/\/$/, '')}/admin/clear`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json', 'X-Admin-Token': token },
+    body: JSON.stringify({ before: before || new Date().toISOString() }),
+  });
+  return r.json().catch(() => ({ ok: false }));
+}
+
+// ── Chuyển đổi format: slot status → booking map dùng cho renderSlots ─
+// wkSlotData: { "09:00": { pending: 2, accepted: false } }
+// → loadBK() format: { "2024-01-15": { "09:00": [{status:"pending"}, ...] } }
+function applySlotStatus(date, slotData) {
+  if (!slotData) return;
+  const bk = loadBK();
+  if (!bk[date]) bk[date] = {};
+  // Reset slot data cho ngày này từ KV
+  for (const [time, info] of Object.entries(slotData)) {
+    if (!bk[date][time]) bk[date][time] = [];
+    // Cập nhật số lượng pending và trạng thái accepted
+    // (không cần biết chi tiết, chỉ cần hiển thị đúng)
+    const existing = bk[date][time];
+    // Nếu KV báo accepted nhưng local không có → thêm giả 1 record accepted
+    const hasAcc = existing.some(b => b.status === 'accepted');
+    if (info.accepted && !hasAcc) {
+      existing.push({ id: '_remote_acc', status: 'accepted', name: '', phone: '', at: new Date().toISOString() });
+    } else if (!info.accepted && hasAcc) {
+      // Slot không còn accepted trên server → xóa remote record
+      bk[date][time] = existing.filter(b => b.id !== '_remote_acc');
+    }
+    // Cập nhật pending count (thêm giả nếu server có nhiều hơn local)
+    const localPend = existing.filter(b => b.status === 'pending').length;
+    if (info.pending > localPend) {
+      for (let i = 0; i < info.pending - localPend; i++) {
+        bk[date][time].push({ id: `_remote_${Date.now()}_${i}`, status: 'pending', name: '', phone: '', at: new Date().toISOString() });
       }
-      if(r.status===401) return {ok:false,msg:'❌ Lỗi 401: Token không hợp lệ hoặc đã hết hạn. Vào ⚙️ Cài đặt → xóa token cũ → tạo PAT mới trên GitHub → dán vào và nhấn Lưu.'};
-      if(r.status===403) return {ok:false,msg:'❌ Lỗi 403: Token thiếu quyền ghi. Khi tạo PAT cần chọn quyền Contents: Read & Write.'};
-      return {ok:false,msg:`❌ Lỗi ${r.status}: ${err.message||'Kiểm tra PAT & quyền repo'}`};
-    }catch(e){return {ok:false,msg:`❌ Lỗi kết nối: ${e.message}`};}
+    }
   }
-  return {ok:false,msg:'❌ Không thể ghi lên GitHub sau nhiều lần thử.'};
+  saveBK(bk);
 }
 
-function buildGHPayload(){
-  // ⚠️ FIX: Loại bỏ các trường base64 khổng lồ khỏi data.json.
-  // profilePhoto / clinicPhoto / gallery được lưu riêng trong images.json
-  // để Worker đọc data.json không bị lỗi parse do file quá lớn.
-  const {profilePhoto:_pp, clinicPhoto:_cp, gallery:_gl, ...adminDataClean}=loadAD();
+// ── Áp dụng booking đầy đủ từ Worker vào localStorage (cho admin) ─────
+function applyFullBookings(allBookings) {
+  // allBookings: { "2024-01-15": { "09:00": [{id,name,phone,...}] } }
+  if (!allBookings || typeof allBookings !== 'object') return;
+  // Ghi đè hoàn toàn — dữ liệu từ KV là nguồn sự thật duy nhất
+  saveBK(allBookings);
+}
+
+// ══════════════════════════════════════════════════════
+// GITHUB PERSISTENCE — CHỈ cho content & images
+// (Booking đã chuyển sang Cloudflare KV)
+// ══════════════════════════════════════════════════════
+
+function ghCfgResolved() {
+  const cfg = loadGHCfg();
   return {
-    bookings  : loadBK(),
-    adminData : adminDataClean,
-    content   : loadCT(),
-    adminHash : localStorage.getItem(AH)||null,
-    updatedAt : new Date().toISOString()
+    owner:  GH_OWNER  || cfg.owner  || '',
+    repo:   GH_REPO   || cfg.repo   || '',
+    branch: GH_BRANCH || cfg.branch || 'main',
+    file:   GH_FILE   || cfg.file   || 'data.json',
+    token:  cfg.token || '',
   };
 }
 
-// ── IMAGES.JSON — file riêng cho ảnh base64 ──────────
-function buildImagesPayload(){
-  const ad=loadAD();
-  const p={updatedAt:new Date().toISOString()};
-  if(ad.profilePhoto) p.profilePhoto=ad.profilePhoto;
-  if(ad.clinicPhoto)  p.clinicPhoto=ad.clinicPhoto;
-  if(ad.gallery&&ad.gallery.length) p.gallery=ad.gallery;
+// Chỉ fetch content & adminData từ GitHub (không fetch bookings nữa)
+async function ghFetchContent() {
+  const c = ghCfgResolved();
+  if (!c.owner || !c.repo) return null;
+  try {
+    let raw;
+    if (c.token) {
+      const r = await fetch(
+        `https://api.github.com/repos/${c.owner}/${c.repo}/contents/${c.file}?ref=${c.branch}`,
+        { headers: { 'Authorization': `Bearer ${c.token}`, 'Accept': 'application/vnd.github.v3+json' } }
+      );
+      if (!r.ok) return null;
+      const d = await r.json();
+      raw = new TextDecoder().decode(
+        Uint8Array.from(atob(d.content.replace(/\n/g, '')), ch => ch.charCodeAt(0))
+      );
+    } else {
+      const url = `https://raw.githubusercontent.com/${c.owner}/${c.repo}/${c.branch}/${c.file}?_=${Date.now()}`;
+      const r = await fetch(url);
+      if (!r.ok) return null;
+      raw = await r.text();
+    }
+    const parsed = JSON.parse(raw);
+    // Loại bỏ trường bookings nếu có (không dùng nữa)
+    delete parsed.bookings;
+    return parsed;
+  } catch { return null; }
+}
+
+async function ghGetFileSha() {
+  const c = ghCfgResolved();
+  if (!c.owner || !c.repo || !c.token) return null;
+  try {
+    const r = await fetch(
+      `https://api.github.com/repos/${c.owner}/${c.repo}/contents/${c.file}?ref=${c.branch}`,
+      { headers: { 'Authorization': `Bearer ${c.token}`, 'Accept': 'application/vnd.github.v3+json' } }
+    );
+    if (!r.ok) return null;
+    return (await r.json()).sha || null;
+  } catch { return null; }
+}
+
+// Push lên GitHub — CHỈ content & adminData (không push bookings)
+async function ghPushContent(payload) {
+  const c = ghCfgResolved();
+  if (!c.owner || !c.repo) return { ok: false, msg: '❌ Chưa điền GH_OWNER / GH_REPO' };
+  if (!c.token)             return { ok: false, msg: '❌ Chưa nhập PAT — vào ⚙️ Cài đặt' };
+
+  const MAX = 3;
+  for (let attempt = 1; attempt <= MAX; attempt++) {
+    const sha     = await ghGetFileSha();
+    const content = btoa(unescape(encodeURIComponent(JSON.stringify(payload, null, 2))));
+    const body    = {
+      message: `Cập nhật nội dung ${new Date().toLocaleString('vi-VN')}`,
+      content,
+      branch: c.branch,
+    };
+    if (sha) body.sha = sha;
+    try {
+      const r = await fetch(
+        `https://api.github.com/repos/${c.owner}/${c.repo}/contents/${c.file}`,
+        {
+          method: 'PUT',
+          headers: { 'Authorization': `Bearer ${c.token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        }
+      );
+      if (r.ok) return { ok: true, msg: '✅ Đã lưu nội dung lên GitHub!' };
+      const err = await r.json().catch(() => ({}));
+      if (r.status === 409 || (err.message && err.message.includes('SHA'))) {
+        if (attempt < MAX) { await new Promise(res => setTimeout(res, 400 * attempt)); continue; }
+        return { ok: false, msg: '❌ Xung đột SHA. Thử lại sau.' };
+      }
+      if (r.status === 401) return { ok: false, msg: '❌ Lỗi 401: Token không hợp lệ hoặc hết hạn.' };
+      if (r.status === 403) return { ok: false, msg: '❌ Lỗi 403: Token thiếu quyền Contents: Read & Write.' };
+      return { ok: false, msg: `❌ Lỗi ${r.status}: ${err.message || ''}` };
+    } catch (e) { return { ok: false, msg: `❌ Lỗi kết nối: ${e.message}` }; }
+  }
+  return { ok: false, msg: '❌ Không thể lưu sau nhiều lần thử.' };
+}
+
+// Tạo payload chỉ chứa content & settings (không có bookings)
+function buildGHPayload() {
+  const { profilePhoto: _pp, clinicPhoto: _cp, gallery: _gl, ...adminDataClean } = loadAD();
+  return {
+    adminData:  adminDataClean,
+    content:    loadCT(),
+    adminHash:  localStorage.getItem(AH) || null,
+    updatedAt:  new Date().toISOString(),
+    // bookings: KHÔNG LƯU — đã chuyển sang Cloudflare KV
+  };
+}
+
+// ── Images.json — không thay đổi ─────────────────────────────────────
+async function ghGetImgSha() {
+  const c = ghCfgResolved();
+  if (!c.owner || !c.repo || !c.token) return null;
+  try {
+    const r = await fetch(
+      `https://api.github.com/repos/${c.owner}/${c.repo}/contents/${GH_IMG_FILE}?ref=${c.branch}`,
+      { headers: { 'Authorization': `Bearer ${c.token}`, 'Accept': 'application/vnd.github.v3+json' } }
+    );
+    if (!r.ok) return null;
+    return (await r.json()).sha || null;
+  } catch { return null; }
+}
+
+async function syncImagesToGH(statusCb) {
+  const c = ghCfgResolved();
+  if (!c.owner || !c.repo || !c.token) return { ok: false, msg: 'Chưa có token' };
+  if (statusCb) statusCb('loading', '⏳ Đang lưu ảnh lên GitHub…');
+  const sha     = await ghGetImgSha();
+  const payload = buildImagesPayload();
+  const content = btoa(unescape(encodeURIComponent(JSON.stringify(payload, null, 2))));
+  const body    = { message: `Cập nhật ảnh ${new Date().toLocaleString('vi-VN')}`, content, branch: c.branch };
+  if (sha) body.sha = sha;
+  try {
+    const r = await fetch(
+      `https://api.github.com/repos/${c.owner}/${c.repo}/contents/${GH_IMG_FILE}`,
+      { method: 'PUT', headers: { 'Authorization': `Bearer ${c.token}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+    );
+    if (r.ok) { if (statusCb) statusCb('ok', '✅ Ảnh đã lưu lên GitHub!'); return { ok: true }; }
+    const e   = await r.json().catch(() => ({}));
+    const msg = `❌ Lỗi lưu ảnh ${r.status}: ${e.message || ''}`;
+    if (statusCb) statusCb('err', msg);
+    return { ok: false, msg };
+  } catch (e) {
+    const msg = `❌ Lỗi kết nối: ${e.message}`;
+    if (statusCb) statusCb('err', msg);
+    return { ok: false, msg };
+  }
+}
+
+function buildImagesPayload() {
+  const ad = loadAD();
+  const p  = { updatedAt: new Date().toISOString() };
+  if (ad.profilePhoto) p.profilePhoto = ad.profilePhoto;
+  if (ad.clinicPhoto)  p.clinicPhoto  = ad.clinicPhoto;
+  if (ad.gallery && ad.gallery.length) p.gallery = ad.gallery;
   return p;
 }
 
-async function ghGetImgSha(){
-  const c=ghCfgResolved();
-  if(!c.owner||!c.repo||!c.token) return null;
-  try{
-    const r=await fetch(
-      `https://api.github.com/repos/${c.owner}/${c.repo}/contents/${GH_IMG_FILE}?ref=${c.branch}`,
-      {headers:{'Authorization':`Bearer ${c.token}`,'Accept':'application/vnd.github.v3+json'}}
-    );
-    if(!r.ok) return null;
-    return (await r.json()).sha||null;
-  }catch{return null;}
-}
-
-async function syncImagesToGH(statusCb){
-  const c=ghCfgResolved();
-  if(!c.owner||!c.repo||!c.token) return {ok:false,msg:'Chưa có token'};
-  if(statusCb) statusCb('loading','⏳ Đang lưu ảnh lên GitHub…');
-  const sha=await ghGetImgSha();
-  const payload=buildImagesPayload();
-  const content=btoa(unescape(encodeURIComponent(JSON.stringify(payload,null,2))));
-  const body={message:`Cập nhật ảnh ${new Date().toLocaleString('vi-VN')}`,content,branch:c.branch};
-  if(sha) body.sha=sha;
-  try{
-    const r=await fetch(
-      `https://api.github.com/repos/${c.owner}/${c.repo}/contents/${GH_IMG_FILE}`,
-      {method:'PUT',headers:{'Authorization':`Bearer ${c.token}`,'Accept':'application/vnd.github.v3+json','Content-Type':'application/json'},
-       body:JSON.stringify(body)}
-    );
-    if(r.ok){if(statusCb)statusCb('ok','✅ Ảnh đã lưu lên GitHub!');return{ok:true};}
-    const e=await r.json().catch(()=>({}));
-    const msg=`❌ Lỗi lưu ảnh ${r.status}: ${e.message||''}`;
-    if(statusCb)statusCb('err',msg);
-    return{ok:false,msg};
-  }catch(e){
-    const msg=`❌ Lỗi kết nối: ${e.message}`;
-    if(statusCb)statusCb('err',msg);
-    return{ok:false,msg};
-  }
-}
-
-async function ghFetchImages(){
-  const c=ghCfgResolved();
-  if(!c.owner||!c.repo) return null;
-  try{
-    if(c.token){
-      const r=await fetch(
+async function ghFetchImages() {
+  const c = ghCfgResolved();
+  if (!c.owner || !c.repo) return null;
+  try {
+    if (c.token) {
+      const r = await fetch(
         `https://api.github.com/repos/${c.owner}/${c.repo}/contents/${GH_IMG_FILE}?ref=${c.branch}`,
-        {headers:{'Authorization':`Bearer ${c.token}`,'Accept':'application/vnd.github.v3+json','Cache-Control':'no-cache'}}
+        { headers: { 'Authorization': `Bearer ${c.token}`, 'Accept': 'application/vnd.github.v3+json', 'Cache-Control': 'no-cache' } }
       );
-      if(!r.ok) return null;
-      const d=await r.json();
-      return JSON.parse(decodeURIComponent(escape(atob(d.content.replace(/\n/g,'')))));
+      if (!r.ok) return null;
+      const d = await r.json();
+      return JSON.parse(decodeURIComponent(escape(atob(d.content.replace(/\n/g, '')))));
     }
-    // Fallback public raw URL (bệnh nhân không có token vẫn load được gallery)
-    const url=`https://raw.githubusercontent.com/${c.owner}/${c.repo}/${c.branch}/${GH_IMG_FILE}?_=${Date.now()}`;
-    const r=await fetch(url);
-    if(!r.ok) return null;
+    const url = `https://raw.githubusercontent.com/${c.owner}/${c.repo}/${c.branch}/${GH_IMG_FILE}?_=${Date.now()}`;
+    const r   = await fetch(url);
+    if (!r.ok) return null;
     return await r.json();
-  }catch{return null;}
+  } catch { return null; }
 }
 
-// Chỉ merge bookings từ GH vào local (không ghi đè content / adminData local)
-// Dùng trước khi push để tránh admin vô tình xóa booking của bệnh nhân đặt qua Worker
-// ⚠️ FIX: lọc bỏ ID đã xóa và booking trước thời điểm xóa-toàn-bộ khỏi GH trước khi merge
-function applyGHBookingsOnly(ghBk){
-  if(!ghBk||typeof ghBk!=='object') return;
-  const local=loadBK();
-  const deletedIds=loadDeleted();
-  const clearedBefore=getLastClearTime();
-  const merged=JSON.parse(JSON.stringify(ghBk));
-  // Bước 1: loại khỏi dữ liệu GH những booking admin đã xóa / đã clear
-  for(const d in merged){
-    for(const t in merged[d]){
-      merged[d][t]=(merged[d][t]||[]).filter(b=>{
-        if(deletedIds.has(b.id)) return false;
-        if(clearedBefore&&b.at&&new Date(b.at).getTime()<clearedBefore) return false;
-        return true;
-      });
-      if(!merged[d][t].length) delete merged[d][t];
-    }
-    if(!Object.keys(merged[d]||{}).length) delete merged[d];
-  }
-  // Bước 2: merge local lên trên (giữ status mới nhất của admin)
-  for(const d in local){
-    if(!merged[d]) merged[d]={};
-    for(const t in local[d]){
-      if(!merged[d][t]){
-        merged[d][t]=local[d][t];
-      } else {
-        const localMap={};
-        (local[d][t]||[]).forEach(b=>localMap[b.id]=b);
-        merged[d][t]=(merged[d][t]||[]).map(b=>localMap[b.id]||b);
-        const ghIds=new Set((merged[d][t]||[]).map(b=>b.id));
-        for(const bk of (local[d][t]||[])){
-          if(!ghIds.has(bk.id)) merged[d][t].push(bk);
-        }
-      }
-    }
-  }
-  saveBK(merged);
-}
-
-async function syncToGH(statusCb){
-  if(statusCb) statusCb('loading','⏳ Đang lấy dữ liệu mới nhất từ GitHub…');
-  // Fetch-merge-push: lấy booking mới nhất từ GH (bệnh nhân đặt qua Worker)
-  // trước khi push để tránh ghi đè
-  const ghData=await ghFetchData();
-  if(ghData&&ghData.bookings) applyGHBookingsOnly(ghData.bookings);
-  if(statusCb) statusCb('loading','⏳ Đang lưu lên GitHub…');
-  const r=await ghPushData(buildGHPayload());
-  if(statusCb) statusCb(r.ok?'ok':'err', r.msg);
-  return r;
-}
-
-// Áp dụng data từ GitHub vào localStorage
-function applyGHData(ghData){
-  if(!ghData) return;
-
-  // ── Bookings: merge GH (booking mới từ thiết bị khác) + local (nguồn sự thật cho STATUS) ──
-  // ⚠️ FIX: lọc bỏ booking đã xóa / đã clear trước khi merge (giống applyGHBookingsOnly)
-  if(ghData.bookings && typeof ghData.bookings==='object'){
-    const local=loadBK();
-    const deletedIds=loadDeleted();
-    const clearedBefore=getLastClearTime();
-    const merged=JSON.parse(JSON.stringify(ghData.bookings));
-    // Lọc booking đã bị admin xóa khỏi GH data trước khi merge
-    for(const d in merged){
-      for(const t in merged[d]){
-        merged[d][t]=(merged[d][t]||[]).filter(b=>{
-          if(deletedIds.has(b.id)) return false;
-          if(clearedBefore&&b.at&&new Date(b.at).getTime()<clearedBefore) return false;
-          return true;
-        });
-        if(!merged[d][t].length) delete merged[d][t];
-      }
-      if(!Object.keys(merged[d]||{}).length) delete merged[d];
-    }
-    for(const d in local){
-      if(!merged[d]) merged[d]={};
-      for(const t in local[d]){
-        if(!merged[d][t]){
-          merged[d][t]=local[d][t];
-        } else {
-          const localMap={};
-          (local[d][t]||[]).forEach(b=>localMap[b.id]=b);
-          merged[d][t]=(merged[d][t]||[]).map(b=>localMap[b.id]||b);
-          const ghIds=new Set((merged[d][t]||[]).map(b=>b.id));
-          for(const bk of (local[d][t]||[])){
-            if(!ghIds.has(bk.id)) merged[d][t].push(bk);
-          }
-        }
-      }
-    }
-    saveBK(merged);
-  }
-
-  // ── Admin data (không có ảnh — ảnh nằm trong images.json) ──
-  if(ghData.adminData && typeof ghData.adminData==='object'){
-    const local=loadAD();
-    const merged=Object.assign({},ghData.adminData);
-    // Ảnh base64 LUÔN được bảo toàn từ local (nguồn sự thật là images.json,
-    // không phải data.json — data.json đã không còn chứa ảnh sau khi fix).
-    if(local.profilePhoto) merged.profilePhoto=local.profilePhoto;
-    if(local.clinicPhoto)  merged.clinicPhoto=local.clinicPhoto;
-    if(local.gallery&&local.gallery.length) merged.gallery=local.gallery;
+// ── Áp dụng data GitHub (chỉ content & images, không phải bookings) ──
+function applyGHData(ghData) {
+  if (!ghData) return;
+  if (ghData.adminData && typeof ghData.adminData === 'object') {
+    const local  = loadAD();
+    const merged = Object.assign({}, ghData.adminData);
+    if (local.profilePhoto) merged.profilePhoto = local.profilePhoto;
+    if (local.clinicPhoto)  merged.clinicPhoto  = local.clinicPhoto;
+    if (local.gallery && local.gallery.length) merged.gallery = local.gallery;
     saveAD(merged);
   }
-
-  // ── Nội dung trang ──
-  if(ghData.content && typeof ghData.content==='object'){
-    // ⚠️ FIX: Merge GH content vào local (không ghi đè hoàn toàn → tránh mất nội dung chưa sync)
-    saveCT(Object.assign({},loadCT(),ghData.content));
+  if (ghData.content && typeof ghData.content === 'object') {
+    saveCT(Object.assign({}, loadCT(), ghData.content));
   }
-
-  // ── Mật khẩu admin: GH là nguồn sự thật ──
-  // Chỉ áp dụng nếu GH có hash (không ghi đè khi admin đang đăng nhập)
-  if(ghData.adminHash && typeof ghData.adminHash==='string'){
-    const localHash=localStorage.getItem(AH);
-    // Cập nhật nếu local chưa có hash, hoặc GH hash khác (admin đã đổi mật khẩu từ thiết bị khác)
-    if(!localHash || localHash!==ghData.adminHash){
+  if (ghData.adminHash && typeof ghData.adminHash === 'string') {
+    const localHash = localStorage.getItem(AH);
+    if (!localHash || localHash !== ghData.adminHash) {
       localStorage.setItem(AH, ghData.adminHash);
     }
   }
 }
 
-// Khởi tạo: tải song song data.json + images.json từ GitHub
-async function initFromGH(){
-  const [data, imgData]=await Promise.all([ghFetchData(), ghFetchImages()]);
-  if(data) applyGHData(data);  // merge bookings / content / settings
-  if(imgData){
-    // Ghi đè ảnh từ images.json vào adminData local
-    const ad=loadAD();
-    if(imgData.profilePhoto) ad.profilePhoto=imgData.profilePhoto;
-    if(imgData.clinicPhoto)  ad.clinicPhoto=imgData.clinicPhoto;
-    if(imgData.gallery&&imgData.gallery.length) ad.gallery=imgData.gallery;
+// ── syncToGH: chỉ sync content & images ──────────────────────────────
+async function syncToGH(statusCb) {
+  if (statusCb) statusCb('loading', '⏳ Đang lưu nội dung lên GitHub…');
+  const r = await ghPushContent(buildGHPayload());
+  if (statusCb) statusCb(r.ok ? 'ok' : 'err', r.msg);
+  return r;
+}
+
+// ── doSync: sync content lên GitHub ──────────────────────────────────
+async function doSync() {
+  const c = ghCfgResolved();
+  if (!c.owner || !c.repo) return;
+  if (!c.token) {
+    const sdiv = document.getElementById('ap-gh-sync');
+    if (sdiv) { sdiv.className = 'gh-status info'; sdiv.textContent = 'ℹ️ Vào ⚙️ Cài đặt → nhập PAT để đồng bộ nội dung lên GitHub.'; sdiv.style.display = 'block'; }
+    return;
+  }
+  const sdiv = document.getElementById('ap-gh-sync');
+  const cb   = (state, msg) => { if (sdiv) { sdiv.className = `gh-status ${state}`; sdiv.textContent = msg; sdiv.style.display = 'block'; } };
+  const result = await syncToGH(cb);
+  if (!result.ok && result.msg && (result.msg.includes('401') || result.msg.includes('403'))) {
+    toast('🔑 Token GitHub lỗi! Vào ⚙️ Cài đặt để cập nhật PAT mới.', 'err');
+  }
+}
+
+// ── Khởi tạo: load content từ GH + slot status từ Worker ─────────────
+async function initFromGH() {
+  // Tải song song: content từ GitHub + slot ngày đang chọn từ Worker
+  const [ghData, imgData, slotData] = await Promise.all([
+    ghFetchContent(),
+    ghFetchImages(),
+    wkFetchSlots(aDate),
+  ]);
+
+  if (ghData)   applyGHData(ghData);
+  if (imgData) {
+    const ad = loadAD();
+    if (imgData.profilePhoto) ad.profilePhoto = imgData.profilePhoto;
+    if (imgData.clinicPhoto)  ad.clinicPhoto  = imgData.clinicPhoto;
+    if (imgData.gallery && imgData.gallery.length) ad.gallery = imgData.gallery;
     saveAD(ad);
   }
+  if (slotData) applySlotStatus(aDate, slotData);
+
   applyContentToPage();
   renderGallery();
   updateProfileDisplay();
   updateClinicPhotoDisplay();
   renderSlots();
-  const ap=document.getElementById('admin-panel');
-  if(isAdmin && ap && !ap.classList.contains('hidden')){
-    switchTab(curTab, null);
-  }
-}
 
-// Áp dụng nội dung đã chỉnh sửa lên trang
-function applyContentToPage(){
-  const ct=loadCT();
-  if(!ct||!Object.keys(ct).length) return;
-  const set=(id,val)=>{const el=document.getElementById(id);if(el&&val)el.textContent=val};
-  const setHtml=(id,val)=>{const el=document.getElementById(id);if(el&&val)el.innerHTML=val};
-  const setAttr=(sel,attr,val)=>{const el=document.querySelector(sel);if(el&&val)el[attr]=val};
-  if(ct.heroBig1) set('ce-hero-big1',ct.heroBig1);
-  if(ct.heroBig2) set('ce-hero-big2',ct.heroBig2);
-  if(ct.heroBig3) set('ce-hero-big3',ct.heroBig3);
-  if(ct.heroSub)  set('ce-hero-sub',ct.heroSub);
-  if(ct.docName)  document.querySelectorAll('.ce-doc-name').forEach(el=>el.textContent=ct.docName);
-  if(ct.docBio)   set('ce-doc-bio',ct.docBio);
-  if(ct.trustMsg) set('ce-trust-msg',ct.trustMsg);
-  if(ct.stat1n)   set('ce-stat1n',ct.stat1n);
-  if(ct.stat1l)   setHtml('ce-stat1l',ct.stat1l);
-  if(ct.stat2n)   set('ce-stat2n',ct.stat2n);
-  if(ct.stat2l)   setHtml('ce-stat2l',ct.stat2l);
-  if(ct.stat3n)   set('ce-stat3n',ct.stat3n);
-  if(ct.stat3l)   setHtml('ce-stat3l',ct.stat3l);
-  if(ct.bkHint)   set('bk-hint',ct.bkHint);
-  if(ct.photoCap) set('ce-photo-cap',ct.photoCap);
-}
-
-function addBooking(date,time,info){
-  const b=loadBK();
-  if(!b[date])b[date]={};
-  if(!b[date][time])b[date][time]=[];
-  b[date][time].push({...info,id:genId(),at:new Date().toISOString(),status:'pending'});
-  saveBK(b);
-}
-// setStatus được định nghĩa dưới phần BOOKING ACTIONS
-
-// ── SLOT SESSIONS ────────────────────────────────────
-function genS(sh,eh){const s=[];let h=sh,m=0;while(h<eh){s.push(`${z(h)}:${z(m)}`);m+=30;if(m>=60){m=0;h++}}return s}
-function getSess(d){const wd=d.getDay();
-  if(wd===0||wd===6)return[{lbl:'Ca Sáng (9:00–12:00)',ic:'ph-sun',s:genS(9,12)},{lbl:'Ca Chiều (15:00–20:00)',ic:'ph-moon-stars',s:genS(15,20)}];
-  return[{lbl:'Ca Tối (17:00–20:00)',ic:'ph-moon-stars',s:genS(17,20)}];
-}
-
-// ── DATE PICKER ──────────────────────────────────────
-function renderDates(){
-  const el=document.getElementById('date-scr');el.innerHTML='';const t=new Date();
-  for(let i=0;i<7;i++){const d=new Date(t);d.setDate(t.getDate()+i);const k=fmtK(d);
-    const btn=document.createElement('button');btn.className='d-btn'+(k===aDate?' act':'');
-    btn.innerHTML=`<span class="db-d">${DAYS[d.getDay()]}</span><span class="db-n">${d.getDate()}</span><span class="db-m">Th${d.getMonth()+1}</span>`;
-    btn.onclick=()=>{aDate=k;renderDates();renderSlots()};el.appendChild(btn);}
-}
-
-// ── SLOT GRID ────────────────────────────────────────
-function renderSlots(){
-  const d=new Date(aDate+'T00:00:00'),c=document.getElementById('bk-slots');c.innerHTML='';
-  getSess(d).forEach(({lbl,ic,s})=>{
-    const sec=document.createElement('div');
-    sec.innerHTML=`<div class="slot-lbl"><i class="ph ${ic}"></i>${lbl}</div>`;
-    const g=document.createElement('div');g.className='slot-g';
-    s.forEach(t=>{
-      const acc=hasAccepted(aDate,t), cnt=getPendCnt(aDate,t);
-      const btn=document.createElement('button');
-      btn.className='s-btn'+(acc?' disabled':'');
-      btn.disabled=acc;
-      btn.innerHTML=t+(cnt>0?`<span class="s-badge">${cnt}</span>`:'');
-      if(!acc)btn.onclick=()=>openM(t);
-      g.appendChild(btn);
-    });
-    sec.appendChild(g);c.appendChild(sec);
-  });
-}
-
-function smartDate(){const t=new Date(),now=t.getHours()*60+t.getMinutes();
-  for(let i=0;i<7;i++){const d=new Date(t);d.setDate(t.getDate()+i);const k=fmtK(d);
-    for(const {s} of getSess(d))for(const tm of s){const[hh,mm]=tm.split(':').map(Number);
-      if(!hasAccepted(k,tm)&&(i>0||hh*60+mm>now+30)){aDate=k;return;}
+  // Nếu admin đang mở panel → tải full booking data từ Worker
+  if (isAdmin) {
+    const ap = document.getElementById('admin-panel');
+    if (ap && !ap.classList.contains('hidden')) {
+      await refreshAdminBookings();
     }
   }
 }
-smartDate();
 
-// ── MODAL ────────────────────────────────────────────
-function openM(time){
-  pending={dk:aDate,time};
-  const[y,m,d]=aDate.split('-');
-  document.getElementById('m-si').textContent=`${d}/${m}/${y} – ${time}`;
-  document.getElementById('m-form').reset();
-  document.getElementById('modal').classList.add('on');
-}
-function closeM(){document.getElementById('modal').classList.remove('on');pending=null;}
-document.getElementById('m-x').onclick=closeM;
-document.getElementById('modal').onclick=e=>{if(e.target===document.getElementById('modal'))closeM();};
+// ── Admin: tải và hiển thị bookings từ Worker ─────────────────────────
+async function refreshAdminBookings() {
+  if (!getAdminToken()) return;
+  const today = new Date();
+  const from  = new Date(today);
+  from.setDate(today.getDate() - 7);         // 7 ngày qua
+  const to    = new Date(today);
+  to.setDate(today.getDate() + 30);          // 30 ngày tới
 
-document.getElementById('m-form').onsubmit=async e=>{
-  e.preventDefault();if(!pending)return;
-  const name=document.getElementById('f-name').value.trim();
-  const phone=document.getElementById('f-phone').value.trim();
-  const note=document.getElementById('f-note').value.trim();
-  if(!name||!phone){toast('Vui lòng nhập họ tên và SĐT.','err');return;}
-
-  // Lưu trước khi closeM() xóa pending
-  const bkDate=pending.dk, bkTime=pending.time;
-
-  // Helper gửi email (dùng biến đã capture)
-  const sendEmail=async()=>{try{
-    if(typeof emailjs!=='undefined'&&EJS_PUB!=='YOUR_PUBLIC_KEY'){
-      await emailjs.send(EJS_SVC,EJS_TPL,{
-        patient_name:name,patient_phone:phone,
-        booking_date:bkDate,booking_time:bkTime,
-        symptom:note||'Không ghi chú',
-        booked_at:new Date().toLocaleString('vi-VN')
-      });
-    }
-  }catch(err){console.error('EmailJS error:',err);}};
-
-  const wkUrl=getWorkerUrl();
-
-  // ══════════════════════════════════════════════════
-  // LUỒNG 1 — Bệnh nhân (qua Cloudflare Worker, không cần PAT)
-  // ══════════════════════════════════════════════════
-  if(wkUrl&&wkUrl!=='YOUR_WORKER_URL'){
-    const btn=document.querySelector('.m-sub');
-    if(btn){btn.disabled=true;btn.textContent='⏳ Đang xử lý…';}
-    try{
-      const res=await fetch(wkUrl,{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({date:bkDate,time:bkTime,name,phone,note:note||''})
-      });
-      const result=await res.json();
-      if(btn){btn.disabled=false;btn.textContent='Xác nhận đặt lịch';}
-      if(result.ok){
-        closeM();
-        toast('✅ Đặt lịch thành công! Phòng khám sẽ liên hệ xác nhận.','ok');
-        // Reload từ GitHub sau 1.5s để cập nhật slot hiển thị
-        setTimeout(()=>initFromGH().then(()=>{renderDates();renderSlots();}),1500);
-        sendEmail();
-      } else {
-        toast(result.msg||'❌ Không thể đặt lịch, vui lòng thử lại.','err');
-        // Slot đã bị accepted từ người khác → đóng modal và refresh
-        if(result.msg&&result.msg.includes('chấp nhận')){
-          closeM();
-          setTimeout(()=>initFromGH().then(()=>{renderDates();renderSlots();}),500);
-        }
-      }
-    }catch(err){
-      if(btn){btn.disabled=false;btn.textContent='Xác nhận đặt lịch';}
-      toast('❌ Lỗi kết nối tới server, vui lòng thử lại.','err');
-      console.error('Worker booking error:',err);
-    }
-    return; // kết thúc LUỒNG 1
+  const fmtDate = d => d.toISOString().slice(0, 10);
+  const data = await wkAdminFetchBookings(fmtDate(from), fmtDate(to));
+  if (data) {
+    applyFullBookings(data);
+    if (curTab === 'bookings') switchTab('bookings', null);
   }
-
-  // ══════════════════════════════════════════════════
-  // LUỒNG 2 — Admin browser hoặc Worker chưa cấu hình
-  // (lưu local + sync trực tiếp qua PAT)
-  // ══════════════════════════════════════════════════
-  addBooking(bkDate,bkTime,{name,phone,note});
-  closeM();renderSlots();
-  doSync();   // không await để không block UI
-  sendEmail();
-  toast('✅ Đặt lịch thành công! Phòng khám sẽ liên hệ xác nhận.','ok');
-};
-
-// ── TOAST ────────────────────────────────────────────
-function toast(msg,type='ok'){
-  const c=document.getElementById('toast-w'),t=document.createElement('div');t.className='tk';
-  t.innerHTML=`<i class="ph ${type==='ok'?'ph-check-circle':'ph-warning-circle'}" style="color:${type==='ok'?'#00a060':'#e05050'};font-size:17px;flex-shrink:0"></i><span>${msg}</span>`;
-  c.appendChild(t);requestAnimationFrame(()=>t.classList.add('on'));
-  setTimeout(()=>{t.classList.remove('on');setTimeout(()=>t.remove(),400);},3400);
-}
-
-// ── FLOAT CTA ────────────────────────────────────────
-let fcOn=false;const fcta=document.getElementById('fcta');
-window.addEventListener('scroll',()=>{const p=scrollY/(document.body.scrollHeight-innerHeight);
-  if(p>.28&&!fcOn){fcOn=true;fcta.classList.add('on');}else if(p<.08&&fcOn){fcOn=false;fcta.classList.remove('on');}
-},{passive:true});
-
-// ── REVEAL ───────────────────────────────────────────
-document.querySelectorAll('.rv').forEach(el=>new IntersectionObserver(
-  en=>{en.forEach(e=>{if(e.isIntersecting)e.target.classList.add('in');})},{threshold:.1}
-).observe(el));
-
-// ── GALLERY ──────────────────────────────────────────
-function renderGallery(){
-  const ad=loadAD(), gallery=ad.gallery||[];
-  const sec=document.getElementById('gallery-section'), grid=document.getElementById('gallery-grid');
-  if(!sec||!grid)return;
-  if(gallery.length===0){sec.style.display='none';return;}
-  sec.style.display='';
-  grid.innerHTML=gallery.map((img,i)=>`<div class="gal-item"><img src="${img.data}" alt="Ảnh ${i+1}" loading="lazy"></div>`).join('');
-}
-
-// ── PROFILE PHOTO ────────────────────────────────────
-function updateProfileDisplay(){
-  const ad=loadAD(), av=document.querySelector('.doc-av');if(!av)return;
-  if(ad.profilePhoto){
-    av.innerHTML=`<img src="${ad.profilePhoto}" alt="BS TTĐ" style="width:100%;height:100%;object-fit:cover;border-radius:18px">`;
-    av.style.padding='0';
-  }else{
-    av.textContent='TTĐ';av.style.padding='';
-  }
-}
-
-// ── CLINIC PHOTO ─────────────────────────────────────
-function updateClinicPhotoDisplay(){
-  const ad=loadAD(),img=document.getElementById('ph-img');
-  if(!img)return;
-  if(ad.clinicPhoto)img.src=ad.clinicPhoto;
 }
 
 // ══════════════════════════════════════════════════════
-// ADMIN PANEL
-// Kích hoạt: click logo trên nav 7 lần trong 2 giây
+// ADMIN ACTIONS — dùng Worker KV thay vì GitHub
 // ══════════════════════════════════════════════════════
-let _lc=0,_lt=null, curTab='bookings';
 
-document.querySelector('.nb-brand').addEventListener('click',()=>{
-  _lc++;if(_lt)clearTimeout(_lt);
-  _lt=setTimeout(()=>{_lc=0;},2000);
-  if(_lc>=7){
-    _lc=0;
-    const pass=prompt('🔐 Nhập mật khẩu quản trị:');
-    if(pass===null) return;
-    const stored=localStorage.getItem(AH);
-    if(!stored){
-      const c=prompt('🔐 Chưa có mật khẩu. Xác nhận lại để tạo mới:');
-      if(c===null) return;
-      if(c===pass && pass.length>=6){
-        sha256(pass).then(h=>{
-          localStorage.setItem(AH,h);
-          isAdmin=true;sessionStorage.setItem('_adm','1');
-          document.getElementById('admin-badge').classList.remove('hidden');
-          openAdminPanel();
-          toast('✅ Mật khẩu đã được thiết lập!','ok');
-        });
-      } else { alert('❌ Mật khẩu không khớp hoặc quá ngắn (tối thiểu 6 ký tự)'); }
-      return;
-    }
-    checkAdminPass(pass).then(ok=>{
-      if(ok){
-        isAdmin=true;sessionStorage.setItem('_adm','1');
-        document.getElementById('admin-badge').classList.remove('hidden');
-        openAdminPanel();
-        toast('✅ Đăng nhập thành công!','ok');
-      } else { alert('❌ Mật khẩu không đúng'); }
-    });
-  }
-});
-if(isAdmin)document.getElementById('admin-badge').classList.remove('hidden');
+// THAY THẾ apAccept / apDecline / apDeleteBook / apRestoreBook / apClearHistory
+// bằng các hàm dưới đây:
 
-function openAdminPanel(){
-  switchTab(curTab,null);
-  document.getElementById('admin-panel').classList.remove('hidden');
-  // Tải dữ liệu mới nhất từ GitHub ngay khi mở panel (không đợi auto-refresh 15s)
-  (async()=>{
-    const data=await ghFetchData();
-    if(data&&data.bookings){
-      const before=JSON.stringify(loadBK());
-      applyGHBookingsOnly(data.bookings);
-      renderSlots();
-      // Chỉ re-render panel nếu có booking mới (tránh nhấp nháy không cần thiết)
-      if(JSON.stringify(loadBK())!==before) switchTab(curTab,null);
-    }
-  })();
-}
-window.closeAdminPanel=function(){document.getElementById('admin-panel').classList.add('hidden');};
-
-// ── SHARED SYNC STATUS ────────────────────────────────
-async function doSync(){
-  const c=ghCfgResolved();
-  if(!c.owner||!c.repo) return;
-  if(!c.token){
-    // Chưa nhập token: dữ liệu chỉ lưu cục bộ, không đồng bộ
-    const sdiv=document.getElementById('ap-gh-sync');
-    if(sdiv){sdiv.className='gh-status info';sdiv.textContent='ℹ️ Dữ liệu lưu cục bộ. Vào ⚙️ Cài đặt → nhập PAT để đồng bộ GitHub.';sdiv.style.display='block';}
-    return;
-  }
-  const sdiv=document.getElementById('ap-gh-sync');
-  const cb=(state,msg)=>{if(sdiv){sdiv.className=`gh-status ${state}`;sdiv.textContent=msg;sdiv.style.display='block';}};
-  const result=await syncToGH(cb);
-  // Hiện toast nổi bật khi lỗi token để admin biết cần hành động ngay
-  if(!result.ok){
-    if(result.msg&&(result.msg.includes('401')||result.msg.includes('403'))){
-      toast('🔑 Token GitHub lỗi! Vào ⚙️ Cài đặt để cập nhật PAT mới.','err');
-    }
-  }
-}
-
-// ─────────────────────────────────────────────────────
-// SWITCH TAB
-// ─────────────────────────────────────────────────────
-window.switchTab=function(tab,btn){
-  curTab=tab;
-  document.querySelectorAll('.ap-tab').forEach(b=>b.classList.remove('active'));
-  if(btn) btn.classList.add('active');
-  else{
-    const tabNames=['bookings','profile','gallery','content','settings'];
-    const idx=tabNames.indexOf(tab);
-    const tbs=document.querySelectorAll('.ap-tab');
-    if(tbs[idx]) tbs[idx].classList.add('active');
-  }
-  const panel=document.getElementById('admin-content');
-
-  // ─── TAB: BOOKINGS ───────────────────────────────
-  if(tab==='bookings'){
-    const bk=loadBK(), dk=Object.keys(bk).sort();
-    let totalPend=0;
-    dk.forEach(d=>Object.values(bk[d]||{}).forEach(arr=>arr.forEach(b=>{if(b.status==='pending')totalPend++;})));
-    if(dk.length===0){panel.innerHTML='<p class="ap-empty">📭 Chưa có lịch đặt nào.</p>';return;}
-    const esc=s=>(s||'').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    let h=`<div class="ap-clear-bar">
-      ${totalPend===0?'<span style="font-size:11px;color:var(--ts)">Không có lịch chờ</span>':''}
-      <button class="ap-btn-clear-all" onclick="apClearHistory()">🗑 Xóa toàn bộ lịch sử</button>
-    </div>`;
-    dk.forEach(date=>{
-      const[y,m,d]=date.split('-');
-      h+=`<div class="ap-date-group"><div class="ap-date-head">📅 ${d}/${m}/${y}</div>`;
-      Object.entries(bk[date]).sort().forEach(([time,bks])=>{
-        const pCnt=bks.filter(b=>b.status==='pending').length;
-        h+=`<div class="ap-slot-group"><div class="ap-slot-time">${time}${pCnt>0?` <span class="s-badge" style="position:static;transform:none">${pCnt}</span>`:''}</div>`;
-        bks.forEach(bki=>{
-          const sc=bki.status==='accepted'?'ap-status-ok':bki.status==='declined'?'ap-status-no':'ap-status-pending';
-          const st=bki.status==='accepted'?'✅ Đã chấp nhận':bki.status==='declined'?'❌ Đã từ chối':'⏳ Chờ duyệt';
-          h+=`<div class="ap-bk-card">
-            <div class="ap-bk-info">
-              <strong>${esc(bki.name)}</strong> &middot; ${esc(bki.phone)}
-              ${bki.note?`<br><span class="ap-bk-note">${esc(bki.note)}</span>`:''}
-              <br><span class="ap-bk-meta">${new Date(bki.at).toLocaleString('vi-VN')}</span>
-            </div>
-            <span class="ap-status ${sc}">${st}</span>
-            ${bki.status==='pending'?`<div class="ap-bk-actions">
-              <button class="ap-btn-ok" onclick="apAccept('${date}','${time}','${bki.id}')">✅ Chấp nhận</button>
-              <button class="ap-btn-no" onclick="apDecline('${date}','${time}','${bki.id}')">❌ Từ chối</button>
-            </div>`:''}
-            ${bki.status==='declined'?`<div class="ap-bk-actions">
-              <button class="ap-btn-restore" onclick="apRestoreBook('${date}','${time}','${bki.id}')">↩ Khôi phục</button>
-              <button class="ap-btn-del" onclick="apDeleteBook('${date}','${time}','${bki.id}')">🗑 Xóa</button>
-            </div>`:''}
-            ${bki.status==='accepted'?`<div class="ap-bk-actions">
-              <button class="ap-btn-restore" onclick="apDecline('${date}','${time}','${bki.id}')">↩ Hủy chấp nhận</button>
-              <button class="ap-btn-del" onclick="apDeleteBook('${date}','${time}','${bki.id}')">🗑 Xóa</button>
-            </div>`:''}
-          </div>`;
-        });
-        h+='</div>';
-      });
-      h+='</div>';
-    });
-    h+=`<div id="ap-gh-sync" class="gh-status" style="display:none;margin-top:10px"></div>`;
-    panel.innerHTML=h;
-  }
-
-  // ─── TAB: PROFILE ────────────────────────────────
-  else if(tab==='profile'){
-    const ad=loadAD(),pp=ad.profilePhoto||'',cp=ad.clinicPhoto||'';
-    panel.innerHTML=`
-      <div class="ce-section" style="border:none;padding:0 0 18px 0">
-        <div class="ce-section-title">👨‍⚕️ Ảnh bác sĩ phụ trách</div>
-        <div class="ap-info" style="margin-bottom:10px">Thay thế chữ <strong>TTĐ</strong> ở mục <em>Bác sĩ phụ trách</em>. Ảnh vuông hoặc portrait đẹp nhất.</div>
-        <div class="ap-profile-area">
-          <div class="ap-profile-prev">${pp?`<img src="${pp}" alt="BS TTĐ">`:'<span>TTĐ</span>'}</div>
-          <div style="display:flex;flex-direction:column;gap:8px">
-            <label class="ap-upload-btn">
-              <i class="ph ph-camera"></i> Chọn ảnh bác sĩ
-              <input type="file" accept="image/*" style="display:none" onchange="apSetPhoto(this)">
-            </label>
-            ${pp?'<button class="ap-btn-no" style="padding:6px 13px;border-radius:7px;border:none;cursor:pointer;font-family:inherit;font-size:11px;font-weight:700" onclick="apDelPhoto()">🗑 Xóa ảnh</button>':''}
-          </div>
-        </div>
-      </div>
-      <hr style="border:none;border-top:1px solid rgba(0,0,0,.08);margin:4px 0 18px">
-      <div class="ce-section" style="border:none;padding:0">
-        <div class="ce-section-title">🏥 Ảnh phòng khám (section giữa trang)</div>
-        <div class="ap-info" style="margin-bottom:10px">Ảnh hiển thị trong section phòng khám. Landscape (ngang) hiển thị đẹp nhất trên máy tính.</div>
-        ${cp?`<div style="margin-bottom:12px;border-radius:10px;overflow:hidden;max-height:150px;line-height:0;border:1px solid rgba(0,0,0,.08)"><img src="${cp}" alt="Ảnh PK" style="width:100%;height:150px;object-fit:cover"></div>`
-            :'<p style="font-size:11px;color:var(--ts);margin-bottom:10px;padding:8px 12px;background:rgba(0,0,0,.04);border-radius:8px">⚠️ Chưa upload — đang dùng ảnh mặc định trong HTML.</p>'}
-        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-          <label class="ap-upload-btn" style="margin:0">
-            <i class="ph ph-image"></i> Chọn ảnh phòng khám
-            <input type="file" accept="image/*" style="display:none" onchange="apSetClinicPhoto(this)">
-          </label>
-          ${cp?'<button class="ap-btn-no" style="padding:6px 13px;border-radius:7px;border:none;cursor:pointer;font-family:inherit;font-size:11px;font-weight:700" onclick="apDelClinicPhoto()">🗑 Xóa ảnh</button>':''}
-        </div>
-      </div>
-      <div id="ap-gh-sync" class="gh-status" style="display:none;margin-top:10px"></div>`;
-  }
-
-  // ─── TAB: GALLERY ────────────────────────────────
-  else if(tab==='gallery'){
-    const ad=loadAD(), gl=ad.gallery||[];
-    panel.innerHTML=`
-      <div class="ap-info">Hình ảnh được hiển thị trong mục <strong>Thư viện ảnh</strong>. Thêm hoặc xóa ảnh bên dưới.</div>
-      <label class="ap-upload-btn" style="margin-bottom:14px">
-        <i class="ph ph-plus"></i> Thêm hình ảnh
-        <input type="file" accept="image/*" multiple style="display:none" onchange="apAddGal(this)">
-      </label>
-      <div class="ap-gal-grid">
-        ${gl.map((img,i)=>`<div class="ap-gal-item"><img src="${img.data}" alt="Gallery ${i+1}"><button class="ap-gal-rm" onclick="apDelGal(${i})">✕</button></div>`).join('')}
-      </div>
-      ${gl.length===0?'<p class="ap-empty">Chưa có hình ảnh nào.</p>':''}
-      <div id="ap-gh-sync" class="gh-status" style="display:none;margin-top:10px"></div>`;
-  }
-
-  // ─── TAB: NỘI DUNG ───────────────────────────────
-  else if(tab==='content'){
-    const ct=loadCT();
-    const val=(k,def)=>ct[k]!==undefined?ct[k]:def;
-    const g=id=>{const el=document.getElementById(id);return el?el.textContent.trim():'';};
-    panel.innerHTML=`
-      <div class="ap-info">Chỉnh sửa nội dung hiển thị trên trang. Nhấn <strong>💾 Lưu</strong> để áp dụng ngay.</div>
-
-      <div class="ce-section">
-        <div class="ce-section-title">🏷 Tiêu đề trang (Hero)</div>
-        <div class="ce-field"><label class="ce-label">Dòng lớn 1</label>
-          <input class="ce-input" id="ce-f-big1" value="${val('heroBig1',g('ce-hero-big1')||'XƯƠNG')}"></div>
-        <div class="ce-field"><label class="ce-label">Dòng lớn 2</label>
-          <input class="ce-input" id="ce-f-big2" value="${val('heroBig2',g('ce-hero-big2')||'KHỚP')}"></div>
-        <div class="ce-field"><label class="ce-label">Dòng lớn 3 (màu xanh)</label>
-          <input class="ce-input" id="ce-f-big3" value="${val('heroBig3',g('ce-hero-big3')||'CỘT SỐNG')}"></div>
-        <div class="ce-field"><label class="ce-label">Mô tả ngắn phía dưới</label>
-          <textarea class="ce-input" id="ce-f-sub" rows="2">${val('heroSub',g('ce-hero-sub')||'Phòng Khám Ngoại Khoa · Bình Thủy · Cần Thơ')}</textarea></div>
-      </div>
-
-      <div class="ce-section">
-        <div class="ce-section-title">👨‍⚕️ Bác sĩ phụ trách</div>
-        <div class="ce-field"><label class="ce-label">Tên bác sĩ</label>
-          <input class="ce-input" id="ce-f-docname" value="${val('docName',g('ce-doc-name-hero')||'BS.CKI Trang Tiến Đạt')}"></div>
-        <div class="ce-field"><label class="ce-label">Tiểu sử / Giới thiệu</label>
-          <textarea class="ce-input" id="ce-f-docbio" rows="3">${val('docBio',g('ce-doc-bio')||'Chuyên khoa Ngoại Tổng hợp · CKI Chấn thương chỉnh hình')}</textarea></div>
-      </div>
-
-      <div class="ce-section">
-        <div class="ce-section-title">📊 Thống kê</div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
-          <div class="ce-field"><label class="ce-label">Số 1 (con số)</label>
-            <input class="ce-input" id="ce-f-s1n" value="${val('stat1n',g('ce-stat1n')||'1.000+')}"></div>
-          <div class="ce-field"><label class="ce-label">Số 1 (nhãn)</label>
-            <input class="ce-input" id="ce-f-s1l" value="${val('stat1l',g('ce-stat1l')||'Ca phẫu thuật')}"></div>
-          <div class="ce-field"><label class="ce-label">Số 2 (con số)</label>
-            <input class="ce-input" id="ce-f-s2n" value="${val('stat2n',g('ce-stat2n')||'10+')}"></div>
-          <div class="ce-field"><label class="ce-label">Số 2 (nhãn)</label>
-            <input class="ce-input" id="ce-f-s2l" value="${val('stat2l',g('ce-stat2l')||'Năm kinh nghiệm')}"></div>
-          <div class="ce-field"><label class="ce-label">Số 3 (con số)</label>
-            <input class="ce-input" id="ce-f-s3n" value="${val('stat3n',g('ce-stat3n')||'98%')}"></div>
-          <div class="ce-field"><label class="ce-label">Số 3 (nhãn)</label>
-            <input class="ce-input" id="ce-f-s3l" value="${val('stat3l',g('ce-stat3l')||'Hài lòng')}"></div>
-        </div>
-      </div>
-
-      <div class="ce-section">
-        <div class="ce-section-title">📷 Chú thích ảnh phòng khám</div>
-        <div class="ce-field"><label class="ce-label">Chú thích ảnh</label>
-          <input class="ce-input" id="ce-f-photocap" value="${val('photoCap',g('ce-photo-cap')||'Phòng Khám Ngoại Khoa Trang Tiến Đạt')}"></div>
-      </div>
-
-      <div class="ce-section">
-        <div class="ce-section-title">📅 Đặt lịch</div>
-        <div class="ce-field"><label class="ce-label">Ghi chú khung giờ</label>
-          <input class="ce-input" id="ce-f-bkhint" value="${val('bkHint',g('bk-hint')||'')}"></div>
-        <div class="ce-field"><label class="ce-label">Thông điệp tin tưởng</label>
-          <textarea class="ce-input" id="ce-f-trust" rows="2">${val('trustMsg',g('ce-trust-msg')||'')}</textarea></div>
-      </div>
-
-      <div class="ce-save-bar" style="display:flex;gap:8px;flex-wrap:wrap">
-        <button class="ap-btn-ok" style="flex:1;padding:9px" onclick="apSaveContent()">💾 Lưu &amp; áp dụng</button>
-        <button class="ap-btn-no" style="flex:none;padding:9px 16px" onclick="apResetContent()">↺ Mặc định</button>
-      </div>
-      <div id="ap-gh-sync" class="gh-status" style="display:none;margin-top:10px"></div>`;
-  }
-
-  // ─── TAB: CÀI ĐẶT ────────────────────────────────
-  else if(tab==='settings'){
-    const cfg=loadGHCfg();
-    const c=ghCfgResolved();
-    const rawUrl=c.owner&&c.repo
-      ?`https://raw.githubusercontent.com/${c.owner}/${c.repo}/${c.branch}/${c.file}`
-      :'(chưa cấu hình — xem hướng dẫn bên dưới)';
-    const hardcoded=GH_OWNER&&GH_REPO;
-    panel.innerHTML=`
-      <div class="ap-info" style="margin-bottom:14px">
-        <strong>Cách hoạt động:</strong> Thông tin repo được nhúng sẵn trong mã HTML để
-        <em>mọi thiết bị</em> đều đọc được dữ liệu mà không cần cấu hình.
-        Token PAT (ghi) chỉ cần nhập một lần trên thiết bị admin.
-      </div>
-
-      ${!hardcoded?`<div class="gh-status err" style="display:block;margin-bottom:14px">
-        ⚠️ <strong>GH_OWNER và GH_REPO chưa được điền trong mã nguồn.</strong><br>
-        Mở file HTML, tìm dòng <code>const GH_OWNER</code> và điền thông tin repo của bạn, sau đó upload lại lên GitHub.
-      </div>`:`<div class="gh-status ok" style="display:block;margin-bottom:14px">
-        ✅ Repo đã cấu hình: <strong>${c.owner}/${c.repo}</strong> · branch <strong>${c.branch}</strong>
-      </div>`}
-
-      <div class="gh-wrap">
-        <div class="gh-field">
-          <label class="gh-label">🔑 Personal Access Token (PAT) — để ghi dữ liệu</label>
-          <input class="gh-input" id="gh-token" type="password" placeholder="ghp_xxxxxxxxxxxx…" value="${cfg.token||''}">
-          <span style="font-size:10px;color:var(--ts);margin-top:3px;display:block">
-            Token chỉ lưu trong trình duyệt admin. Cấp quyền <em>Contents: Read &amp; Write</em>.
-          </span>
-        </div>
-
-        <div class="gh-btn-row">
-          <button class="gh-btn gh-btn-primary" onclick="ghSaveCfg()">💾 Lưu token</button>
-          <button class="gh-btn gh-btn-secondary" onclick="ghTestConn()">🔌 Kiểm tra</button>
-          <button class="gh-btn gh-btn-primary" onclick="ghSyncNow()">☁ Đồng bộ ngay</button>
-        </div>
-        <div id="gh-status-box" class="gh-status" style="display:none"></div>
-
-        <hr class="gh-divider">
-
-        <div class="gh-field">
-          <label class="gh-label">🌐 Cloudflare Worker URL — để bệnh nhân đặt lịch không cần PAT</label>
-          <input class="gh-input" id="wk-url" type="url" placeholder="https://pk-booking.username.workers.dev" value="${localStorage.getItem(WK)||(WORKER_URL!=='YOUR_WORKER_URL'?WORKER_URL:'')}">
-          <span style="font-size:10px;color:var(--ts);margin-top:3px;display:block">
-            Bắt buộc để bệnh nhân đặt lịch được lưu lên GitHub. Xem hướng dẫn deploy <strong>worker.js</strong> bên dưới.
-          </span>
-        </div>
-        <div class="gh-btn-row">
-          <button class="gh-btn gh-btn-primary" onclick="ghSaveWorker()">💾 Lưu Worker URL</button>
-          <button class="gh-btn gh-btn-secondary" onclick="ghTestWorker()">🔌 Kiểm tra Worker</button>
-        </div>
-        <div id="wk-status-box" class="gh-status" style="display:none"></div>
-        <div style="margin-top:10px;padding:10px;background:rgba(0,184,174,.06);border:1px solid rgba(0,184,174,.18);border-radius:10px;font-size:10px;color:var(--ts);line-height:1.7">
-          <strong>Hướng dẫn nhanh (5 phút):</strong><br>
-          1. Đăng ký miễn phí tại <a href="https://workers.cloudflare.com" target="_blank" style="color:var(--a)">workers.cloudflare.com</a><br>
-          2. Tạo Worker mới → dán nội dung file <strong>worker.js</strong> vào editor<br>
-          3. Vào <em>Settings → Variables</em> → thêm secret <code>GITHUB_TOKEN</code> = PAT của bạn<br>
-          4. Deploy → copy URL → dán vào ô trên → nhấn <strong>Lưu Worker URL</strong>
-        </div>
-
-        <hr class="gh-divider">
-
-        <div class="pw-wrap">
-          <div class="pw-title">🔐 Đổi mật khẩu quản trị</div>
-          <div style="font-size:10px;color:var(--ts);margin-bottom:8px">Mật khẩu sẽ được đồng bộ lên GitHub sau khi lưu.</div>
-          <input class="pw-input" id="pw-old" type="password" placeholder="Mật khẩu hiện tại">
-          <input class="pw-input" id="pw-new" type="password" placeholder="Mật khẩu mới (tối thiểu 6 ký tự)">
-          <input class="pw-input" id="pw-new2" type="password" placeholder="Xác nhận mật khẩu mới">
-          <button class="gh-btn gh-btn-primary" style="margin-top:4px" onclick="apChangePw()">Đổi mật khẩu</button>
-          <div id="pw-status" class="gh-status" style="display:none"></div>
-        </div>
-
-        <hr class="gh-divider">
-        <div style="font-size:10px;color:var(--ts)">
-          📥 Dữ liệu được đọc từ:<br>
-          <code style="word-break:break-all">${rawUrl}</code>
-        </div>
-      </div>`;
-  }
+window.apAccept = async function(date, time, id) {
+  const r = await wkSetStatus(date, time, id, 'accepted');
+  if (r.ok) { await refreshAdminBookings(); renderSlots(); toast('✅ Đã chấp nhận lịch!', 'ok'); }
+  else toast('❌ Lỗi cập nhật: ' + (r.error || ''), 'err');
 };
 
-// ─────────────────────────────────────────────────────
-// BOOKING ACTIONS
-// ─────────────────────────────────────────────────────
-function setStatus(date,time,id,status){
-  const bk=loadBK();
-  if(bk[date]&&bk[date][time]){
-    const idx=bk[date][time].findIndex(b=>b.id===id);
-    if(idx>-1) bk[date][time][idx].status=status;
-    saveBK(bk);
-  }
-}
-window.apAccept=function(date,time,id){
-  setStatus(date,time,id,'accepted');renderSlots();switchTab('bookings',null);
-  toast('✅ Đã chấp nhận — slot đã đóng!','ok');doSync();
-};
-window.apDecline=function(date,time,id){
-  setStatus(date,time,id,'declined');renderSlots();switchTab('bookings',null);
-  toast('❌ Đã từ chối lịch này.','err');doSync();
-};
-window.apRestoreBook=function(date,time,id){
-  setStatus(date,time,id,'pending');renderSlots();switchTab('bookings',null);
-  toast('↩ Đã khôi phục về chờ duyệt.','ok');doSync();
-};
-window.apDeleteBook=function(date,time,id){
-  if(!confirm('Xóa lịch này khỏi danh sách?')) return;
-  const bk=loadBK();
-  if(bk[date]&&bk[date][time]){
-    bk[date][time]=bk[date][time].filter(b=>b.id!==id);
-    if(!bk[date][time].length) delete bk[date][time];
-    if(!Object.keys(bk[date]||{}).length) delete bk[date];
-    saveBK(bk);
-  }
-  addDeletedIds([id]); // ⚠️ FIX: đánh dấu đã xóa → ngăn GH merge phục hồi
-  renderSlots();switchTab('bookings',null);
-  toast('🗑 Đã xóa lịch.','err');doSync();
-};
-window.apClearHistory=function(){
-  if(!confirm('Xóa TOÀN BỘ lịch sử đặt lịch? Không thể hoàn tác!')) return;
-  // ⚠️ FIX: ghi nhớ ID của tất cả booking hiện tại + timestamp clear
-  const bk=loadBK();const allIds=[];
-  for(const d in bk) for(const t in bk[d]) for(const b of (bk[d][t]||[])) allIds.push(b.id);
-  addDeletedIds(allIds);
-  localStorage.setItem(CL,Date.now().toString()); // mốc thời gian clear
-  saveBK({});renderSlots();switchTab('bookings',null);
-  toast('🗑 Đã xóa toàn bộ lịch sử.','err');doSync();
+window.apDecline = async function(date, time, id) {
+  const r = await wkSetStatus(date, time, id, 'declined');
+  if (r.ok) { await refreshAdminBookings(); renderSlots(); toast('❌ Đã từ chối lịch!', 'ok'); }
+  else toast('❌ Lỗi cập nhật: ' + (r.error || ''), 'err');
 };
 
-// ─────────────────────────────────────────────────────
-// PROFILE / GALLERY ACTIONS
-// ─────────────────────────────────────────────────────
-window.apSetPhoto=function(inp){
-  const file=inp.files[0];if(!file)return;
-  const r=new FileReader();
-  r.onload=async e=>{
-    const data=await compressImage(e.target.result, 800, 0.82); // ảnh BS: portrait nhỏ vừa đủ
-    const ad=loadAD();ad.profilePhoto=data;saveAD(ad);
-    updateProfileDisplay();switchTab('profile',null);
-    doSync();syncImagesToGH(null);
-  };
-  r.readAsDataURL(file);
-};
-window.apDelPhoto=function(){
-  const ad=loadAD();delete ad.profilePhoto;saveAD(ad);
-  updateProfileDisplay();switchTab('profile',null);
-  doSync();syncImagesToGH(null);
-};
-window.apSetClinicPhoto=function(inp){
-  const file=inp.files[0];if(!file)return;
-  const r=new FileReader();
-  r.onload=async e=>{
-    const data=await compressImage(e.target.result, 1600, 0.80); // ảnh phòng khám: landscape rộng hơn
-    const ad=loadAD();ad.clinicPhoto=data;saveAD(ad);
-    updateClinicPhotoDisplay();switchTab('profile',null);
-    doSync();syncImagesToGH(null);
-  };
-  r.readAsDataURL(file);
-};
-window.apDelClinicPhoto=function(){
-  const ad=loadAD();delete ad.clinicPhoto;saveAD(ad);
-  updateClinicPhotoDisplay();switchTab('profile',null);
-  doSync();syncImagesToGH(null);
-};
-window.apAddGal=function(inp){
-  const files=Array.from(inp.files);const ad=loadAD();if(!ad.gallery)ad.gallery=[];
-  let n=0;
-  files.forEach(file=>{
-    const r=new FileReader();
-    r.onload=async e=>{
-      const data=await compressImage(e.target.result, 1200, 0.80);
-      ad.gallery.push({data,id:genId()});n++;
-      if(n===files.length){saveAD(ad);renderGallery();switchTab('gallery',null);doSync();syncImagesToGH(null);}
-    };
-    r.readAsDataURL(file);
-  });
-};
-window.apDelGal=function(idx){
-  const ad=loadAD();if(!ad.gallery)return;
-  ad.gallery.splice(idx,1);saveAD(ad);
-  renderGallery();switchTab('gallery',null);
-  doSync();syncImagesToGH(null);
+window.apRestoreBook = async function(date, time, id) {
+  const r = await wkSetStatus(date, time, id, 'pending');
+  if (r.ok) { await refreshAdminBookings(); renderSlots(); toast('↩ Đã khôi phục về chờ duyệt!', 'ok'); }
+  else toast('❌ Lỗi khôi phục: ' + (r.error || ''), 'err');
 };
 
-// ─────────────────────────────────────────────────────
-// CONTENT TAB ACTIONS
-// ─────────────────────────────────────────────────────
-window.apSaveContent=function(){
-  const v=id=>{const el=document.getElementById(id);return el?el.value:'';};
-  const ct={
-    heroBig1:v('ce-f-big1'),heroBig2:v('ce-f-big2'),heroBig3:v('ce-f-big3'),
-    heroSub:v('ce-f-sub'),docName:v('ce-f-docname'),docBio:v('ce-f-docbio'),
-    stat1n:v('ce-f-s1n'),stat1l:v('ce-f-s1l'),stat2n:v('ce-f-s2n'),stat2l:v('ce-f-s2l'),
-    stat3n:v('ce-f-s3n'),stat3l:v('ce-f-s3l'),bkHint:v('ce-f-bkhint'),
-    trustMsg:v('ce-f-trust'),photoCap:v('ce-f-photocap')
-  };
-  saveCT(ct);applyContentToPage();
-  toast('✅ Đã lưu nội dung!','ok');doSync();
-};
-window.apResetContent=function(){
-  if(!confirm('Khôi phục tất cả nội dung về mặc định?')) return;
-  saveCT({});applyContentToPage();switchTab('content',null);
-  toast('↺ Đã khôi phục mặc định.','ok');doSync();
+window.apDeleteBook = async function(date, time, id) {
+  if (!confirm('Xóa lịch đặt này?')) return;
+  const r = await wkDeleteBooking(date, time, id);
+  if (r.ok) { await refreshAdminBookings(); renderSlots(); toast('🗑 Đã xóa lịch!', 'ok'); }
+  else toast('❌ Lỗi xóa: ' + (r.error || ''), 'err');
 };
 
-// ─────────────────────────────────────────────────────
-// SETTINGS TAB ACTIONS
-// ─────────────────────────────────────────────────────
-window.ghSaveCfg=function(){
-  const token=document.getElementById('gh-token').value.trim();
-  // Giữ lại các giá trị cũ (owner/repo/branch/file), chỉ cập nhật token
-  const old=loadGHCfg();
-  saveGHCfg(Object.assign({},old,{token}));
-  const sb=document.getElementById('gh-status-box');
-  sb.className='gh-status ok';sb.textContent='✅ Đã lưu token!';sb.style.display='block';
-};
-window.ghSaveWorker=function(){
-  const url=(document.getElementById('wk-url')||{}).value?.trim()||'';
-  const sb=document.getElementById('wk-status-box');
-  if(!url){sb.className='gh-status err';sb.textContent='❌ Vui lòng nhập URL Worker.';sb.style.display='block';return;}
-  if(!url.startsWith('https://')){sb.className='gh-status err';sb.textContent='❌ URL phải bắt đầu bằng https://';sb.style.display='block';return;}
-  // ⚠️ FIX: Không cho lưu placeholder 'YOUR_WORKER_URL' vào storage
-  if(url==='YOUR_WORKER_URL'){sb.className='gh-status err';sb.textContent='❌ Đây là placeholder, hãy nhập URL Worker thật của bạn!';sb.style.display='block';return;}
-  localStorage.setItem(WK,url);
-  sb.className='gh-status ok';sb.textContent=`✅ Đã lưu! Worker: ${url}`;sb.style.display='block';
-};
-window.ghTestWorker=async function(){
-  const sb=document.getElementById('wk-status-box');
-  const url=getWorkerUrl();
-  if(!url||url==='YOUR_WORKER_URL'){sb.className='gh-status err';sb.textContent='❌ Chưa có Worker URL — nhập URL và nhấn Lưu trước!';sb.style.display='block';return;}
-  sb.className='gh-status loading';sb.textContent='⏳ Đang kiểm tra Worker…';sb.style.display='block';
-  try{
-    // Gửi request test (ngày / giờ giả để không thực sự ghi)
-    const res=await fetch(url,{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({_ping:true})
-    });
-    const result=await res.json().catch(()=>({}));
-    // Worker trả 400 (thiếu field) = Worker đang chạy, kết nối ổn
-    if(res.status===400||result.ok!==undefined){
-      sb.className='gh-status ok';sb.textContent='✅ Worker đang hoạt động! Kết nối thành công.';
-    } else {
-      sb.className='gh-status err';sb.textContent=`❌ Worker phản hồi bất thường (${res.status}). Kiểm tra lại URL.`;
-    }
-  }catch(err){sb.className='gh-status err';sb.textContent=`❌ Lỗi kết nối tới Worker: ${err.message}`;sb.style.display='block';}
-};
-window.ghTestConn=async function(){
-  const sb=document.getElementById('gh-status-box');
-  sb.className='gh-status loading';sb.textContent='⏳ Đang kiểm tra kết nối…';sb.style.display='block';
-  // Lưu token từ form trước khi test
-  const tokenInput=document.getElementById('gh-token');
-  const token=tokenInput?tokenInput.value.trim():'';
-  if(token){const old=loadGHCfg();saveGHCfg(Object.assign({},old,{token}));}
-  const c=ghCfgResolved();
-  if(!c.owner||!c.repo){sb.className='gh-status err';sb.textContent='❌ GH_OWNER / GH_REPO chưa được điền trong mã nguồn!';return;}
-  if(!c.token){sb.className='gh-status err';sb.textContent='❌ Chưa có token — nhập PAT và nhấn Lưu trước!';return;}
-  try{
-    const res=await fetch(`https://api.github.com/repos/${c.owner}/${c.repo}`,{
-      headers:{'Authorization':`Bearer ${c.token}`,'Accept':'application/vnd.github.v3+json'}
-    });
-    if(res.ok){sb.className='gh-status ok';sb.textContent=`✅ Kết nối thành công! Repo: ${c.owner}/${c.repo}`;}
-    else{const e=await res.json();sb.className='gh-status err';sb.textContent=`❌ Lỗi ${res.status}: ${e.message}`;}
-  }catch(e){sb.className='gh-status err';sb.textContent=`❌ Lỗi mạng: ${e.message}`;}
-};
-window.ghSyncNow=async function(){
-  const sb=document.getElementById('gh-status-box');
-  const tokenInput=document.getElementById('gh-token');
-  if(tokenInput&&tokenInput.value.trim()){
-    const old=loadGHCfg();saveGHCfg(Object.assign({},old,{token:tokenInput.value.trim()}));
-  }
-  const cb=(state,msg)=>{sb.className=`gh-status ${state}`;sb.textContent=msg;sb.style.display='block';};
-  // Đồng bộ song song: data.json (bookings/content) + images.json (ảnh base64)
-  const [r1, r2]=await Promise.all([syncToGH(null), syncImagesToGH(null)]);
-  if(r1.ok&&r2.ok) cb('ok','✅ Đồng bộ thành công (data + ảnh)!');
-  else if(r1.ok)   cb('ok',`✅ data.json OK · ${r2.msg||'ảnh: lỗi nhỏ'}`);
-  else             cb('err', r1.msg||'❌ Lỗi đồng bộ');
-};
-window.apChangePw=async function(){
-  const oldPw=document.getElementById('pw-old').value;
-  const newPw=document.getElementById('pw-new').value;
-  const newPw2=document.getElementById('pw-new2').value;
-  const sb=document.getElementById('pw-status');
-  const show=(cls,msg)=>{sb.className=`gh-status ${cls}`;sb.textContent=msg;sb.style.display='block';};
-  if(!oldPw||!newPw||!newPw2){show('err','❌ Vui lòng điền đầy đủ');return;}
-  if(newPw!==newPw2){show('err','❌ Mật khẩu mới không khớp');return;}
-  if(newPw.length<6){show('err','❌ Mật khẩu mới tối thiểu 6 ký tự');return;}
-  const ok=await checkAdminPass(oldPw);
-  if(!ok){show('err','❌ Mật khẩu hiện tại không đúng');return;}
-  const h=await sha256(newPw);
-  localStorage.setItem(AH,h);
-  show('ok','✅ Đổi mật khẩu thành công! Đang đồng bộ lên GitHub…');
-  ['pw-old','pw-new','pw-new2'].forEach(id=>document.getElementById(id).value='');
-  // Đẩy hash mới lên GitHub để đồng bộ mọi thiết bị
-  const sr=await syncToGH(null);
-  show(sr.ok?'ok':'err', sr.ok?'✅ Mật khẩu đã đồng bộ lên GitHub!':sr.msg);
+window.apClearHistory = async function() {
+  if (!confirm('Xóa TOÀN BỘ lịch sử booking? Hành động này không thể hoàn tác!')) return;
+  const r = await wkClearBefore(new Date().toISOString());
+  if (r.ok) {
+    saveBK({});
+    switchTab('bookings', null);
+    toast(`🗑 Đã xóa ${r.deleted || 0} ngày booking cũ!`, 'ok');
+  } else toast('❌ Lỗi xóa lịch sử', 'err');
 };
 
-// ── INIT ─────────────────────────────────────────────
-renderDates();renderSlots();renderGallery();updateProfileDisplay();updateClinicPhotoDisplay();applyContentToPage();
-initFromGH();
+// ══════════════════════════════════════════════════════
+// CẬP NHẬT MODAL SUBMIT — đổi URL sang /book
+// ══════════════════════════════════════════════════════
+// Tìm đoạn:  body:JSON.stringify({_ping:true})
+//            ...res.status===400...
+// Trong hàm kiểm tra Worker, giữ nguyên.
 
-// ── AUTO-REFRESH — cập nhật slot mỗi 15s (hiển thị booking mới từ bệnh nhân) ──
-setInterval(async()=>{
-  const data=await ghFetchData();
-  if(data&&data.bookings){
-    const before=JSON.stringify(loadBK());
-    applyGHBookingsOnly(data.bookings);
+// Tìm đoạn form submit (onsubmit) — thay đổi phần gọi Worker:
+// CŨ:   const res=await fetch(wkUrl, { method:'POST', body:JSON.stringify({date,time,name,phone,note}) });
+// MỚI:  const result=await wkBook(bkDate, bkTime, name, phone, note);
+// Sau đó xử lý result.ok / result.msg như cũ
+
+// ══════════════════════════════════════════════════════
+// AUTO-REFRESH: poll /slots mỗi 10 giây (thay vì GitHub)
+// (nhanh hơn, không tốn GitHub API rate limit)
+// ══════════════════════════════════════════════════════
+setInterval(async () => {
+  const slotData = await wkFetchSlots(aDate);
+  if (slotData) {
+    applySlotStatus(aDate, slotData);
     renderSlots();
-    // Nếu admin đang xem tab bookings → luôn refresh (dù có thay đổi hay không)
-    // để đảm bảo hiển thị đồng bộ với GitHub
-    if(isAdmin&&curTab==='bookings'){
-      const ap=document.getElementById('admin-panel');
-      if(ap&&!ap.classList.contains('hidden')){
-        // Chỉ re-render nếu có thay đổi (tránh nhấp nháy liên tục)
-        if(JSON.stringify(loadBK())!==before) switchTab('bookings',null);
-      }
+  }
+  // Nếu admin đang mở panel bookings → refresh đầy đủ
+  if (isAdmin && curTab === 'bookings') {
+    const ap = document.getElementById('admin-panel');
+    if (ap && !ap.classList.contains('hidden')) {
+      await refreshAdminBookings();
     }
   }
-},15000);
+}, 10000); // 10 giây (tăng lên 30s nếu muốn giảm request)
+
+
+// ══════════════════════════════════════════════════════
+// ADMIN PANEL — cập nhật tab Settings để nhập Admin Token
+// Thêm đoạn HTML này vào tab settings, sau phần Worker URL:
+// ══════════════════════════════════════════════════════
+/*
+  <!-- Thêm vào tab Settings trong admin panel -->
+  <div class="ce-section">
+    <div class="ce-section-title">🔑 Admin Token (Cloudflare KV)</div>
+    <div class="ap-info">Token bí mật để admin đọc/ghi booking qua Worker.<br>
+    Đặt bằng lệnh: <code>wrangler secret put ADMIN_TOKEN</code></div>
+    <div class="fg">
+      <label class="fl">Admin Token</label>
+      <input type="password" id="admin-token-input" class="fi" placeholder="Nhập token bí mật…"
+        value="${sessionStorage.getItem('_atok')||''}">
+    </div>
+    <button class="ap-btn-ok" onclick="apSaveAdminToken()">💾 Lưu Token</button>
+    <div id="admin-token-status" class="gh-status" style="display:none;margin-top:8px"></div>
+  </div>
+*/
+
+window.apSaveAdminToken = async function() {
+  const input = document.getElementById('admin-token-input');
+  const sb    = document.getElementById('admin-token-status');
+  if (!input || !sb) return;
+  const token = input.value.trim();
+  if (!token) { sb.className='gh-status err'; sb.textContent='❌ Nhập token trước!'; sb.style.display='block'; return; }
+  sessionStorage.setItem('_atok', token);
+  // Test kết nối
+  const url = getWorkerUrl();
+  if (url && url !== 'YOUR_WORKER_URL') {
+    try {
+      const r = await fetch(`${url.replace(/\/$/, '')}/admin/bookings`, {
+        headers: { 'X-Admin-Token': token },
+      });
+      if (r.ok || r.status === 200) {
+        sb.className = 'gh-status ok';
+        sb.textContent = '✅ Token hợp lệ! Kết nối KV thành công.';
+      } else {
+        sb.className = 'gh-status err';
+        sb.textContent = `❌ Token không hợp lệ (${r.status}). Kiểm tra lại.`;
+      }
+    } catch (e) {
+      sb.className = 'gh-status err';
+      sb.textContent = `❌ Lỗi kết nối: ${e.message}`;
+    }
+  } else {
+    sb.className = 'gh-status ok';
+    sb.textContent = '✅ Token đã lưu (trong phiên làm việc này).';
+  }
+  sb.style.display = 'block';
+};
+
+// ══════════════════════════════════════════════════════
+// ĐĂNG NHẬP ADMIN — lưu token vào sessionStorage
+// Tìm hàm checkAdminPass và sau dòng isAdmin=true; thêm:
+//   const savedToken = localStorage.getItem('_admin_token_saved');
+//   if (savedToken) sessionStorage.setItem('_atok', savedToken);
+// ══════════════════════════════════════════════════════
+
 </script>
 
 <!-- ADMIN BADGE -->
