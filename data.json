@@ -1,7 +1,20 @@
 {
-  "bookings": {},
+  "bookings": {
+    "2026-07-24": {
+      "18:00": [
+        {
+          "id": "lx7ano88bmrslbx4t",
+          "name": "Trang Chánh Nguyên",
+          "phone": "0367257784",
+          "note": "test 20/07",
+          "at": "2026-07-20T02:13:34.205Z",
+          "status": "pending"
+        }
+      ]
+    }
+  },
   "adminData": {},
   "content": {},
   "adminHash": "e9a00e757aa57cda03a996d3988b48db34bf3f05f8ae4d897dcba3f096e7026e",
-  "updatedAt": "2026-07-20T02:12:32.302Z"
+  "updatedAt": "2026-07-20T02:13:34.205Z"
 }
