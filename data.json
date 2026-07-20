@@ -1,20 +1,7 @@
 {
-  "bookings": {
-    "2026-07-20": {
-      "17:00": [
-        {
-          "id": "dj2dbc6zzmrslvxv4",
-          "name": "NGUYÊN",
-          "phone": "0367257784",
-          "note": "Test 20/7 cuối",
-          "at": "2026-07-20T02:29:08.272Z",
-          "status": "declined"
-        }
-      ]
-    }
-  },
+  "bookings": {},
   "adminData": {},
   "content": {},
   "adminHash": "e9a00e757aa57cda03a996d3988b48db34bf3f05f8ae4d897dcba3f096e7026e",
-  "updatedAt": "2026-07-20T02:30:46.505Z"
+  "updatedAt": "2026-07-20T02:36:20.345Z"
 }
