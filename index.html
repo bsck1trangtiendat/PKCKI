@@ -151,6 +151,11 @@ h2{font-size:clamp(24px,4.5vw,40px);font-weight:800;letter-spacing:-1px;line-hei
 .photo-cap{position:absolute;bottom:24px;left:22px;right:22px;text-align:center}
 .photo-cap h3{font-size:clamp(16px,3.5vw,22px);font-weight:700;color:#fff;margin-bottom:4px;line-height:1.2;text-align:center}
 .photo-cap p{font-size:11px;color:rgba(255,255,255,.6);display:flex;align-items:center;gap:4px;justify-content:center}
+/* ── PHOTO — desktop centered ── */
+@media(min-width:768px){
+  .photo-sizer{aspect-ratio:auto;max-height:none;min-height:0;display:flex;align-items:center;justify-content:center}
+  .photo-img{position:relative;bottom:auto;left:auto;top:auto;transform:none;width:auto;max-width:100%;height:auto;display:block}
+}
 
 /* ── INFO ────────────── */
 #info{padding:68px 18px}
@@ -1283,6 +1288,7 @@ function applyGHData(ghData){
     // ⚠️ FIX: Bảo vệ ảnh local nếu GH không có (push thất bại do ảnh quá lớn)
     const merged=Object.assign({},ghData.adminData);
     if(!merged.profilePhoto && local.profilePhoto) merged.profilePhoto=local.profilePhoto;
+    if(!merged.clinicPhoto && local.clinicPhoto) merged.clinicPhoto=local.clinicPhoto;
     if((!merged.gallery||!merged.gallery.length) && local.gallery && local.gallery.length) merged.gallery=local.gallery;
     saveAD(merged);
   }
@@ -1312,6 +1318,7 @@ async function initFromGH(){
     applyContentToPage();
     renderGallery();
     updateProfileDisplay();
+    updateClinicPhotoDisplay();
     renderSlots();
     // Nếu admin panel đang mở → cập nhật lại tab hiện tại để hiển thị booking mới
     const ap=document.getElementById('admin-panel');
@@ -1520,6 +1527,14 @@ function updateProfileDisplay(){
   }else{
     av.textContent='TTĐ';av.style.padding='';
   }
+}
+
+// ── CLINIC PHOTO ─────────────────────────────────────
+function updateClinicPhotoDisplay(){
+  const ad=loadAD();
+  const img=document.getElementById('ph-img');
+  if(!img)return;
+  if(ad.clinicPhoto) img.src=ad.clinicPhoto;
 }
 
 // ══════════════════════════════════════════════════════
@@ -1745,9 +1760,26 @@ window.switchTab=function(tab,btn){
       </div>
 
       <div class="ce-section">
-        <div class="ce-section-title">📷 Chú thích ảnh phòng khám</div>
+        <div class="ce-section-title">📷 Ảnh &amp; Chú thích phòng khám</div>
         <div class="ce-field"><label class="ce-label">Chú thích ảnh</label>
           <input class="ce-input" id="ce-f-photocap" value="${val('photoCap',g('ce-photo-cap')||'Phòng Khám Ngoại Khoa Trang Tiến Đạt')}"></div>
+        <div class="ce-field" style="margin-top:10px">
+          <label class="ce-label">Ảnh phòng khám (section)</label>
+          ${(()=>{const adNow=loadAD(),cp=adNow.clinicPhoto||'';return cp
+            ?`<div style="margin-bottom:8px;border-radius:10px;overflow:hidden;max-height:140px;line-height:0"><img src="${cp}" alt="Ảnh PK" style="width:100%;height:140px;object-fit:cover"></div>`
+            :'<p style="font-size:11px;color:var(--ts);margin-bottom:8px">Chưa có ảnh — đang dùng ảnh mặc định trong HTML.</p>'
+          })()}
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            <label class="ap-upload-btn" style="margin:0">
+              <i class="ph ph-image"></i> Chọn ảnh mới
+              <input type="file" accept="image/*" style="display:none" onchange="apSetClinicPhoto(this)">
+            </label>
+            ${(()=>{const adNow=loadAD();return adNow.clinicPhoto
+              ?'<button class="ap-btn-no" style="padding:6px 13px;border-radius:7px;border:none;cursor:pointer;font-family:inherit;font-size:11px;font-weight:700" onclick="apDelClinicPhoto()">🗑 Xóa ảnh</button>'
+              :''
+            })()}
+          </div>
+        </div>
       </div>
 
       <div class="ce-section">
@@ -1903,6 +1935,13 @@ window.apSetPhoto=function(inp){
   r.readAsDataURL(file);
 };
 window.apDelPhoto=function(){const ad=loadAD();delete ad.profilePhoto;saveAD(ad);updateProfileDisplay();switchTab('profile',null);doSync();};
+window.apSetClinicPhoto=function(inp){
+  const file=inp.files[0];if(!file)return;
+  const r=new FileReader();
+  r.onload=e=>{const ad=loadAD();ad.clinicPhoto=e.target.result;saveAD(ad);updateClinicPhotoDisplay();switchTab('content',null);doSync();};
+  r.readAsDataURL(file);
+};
+window.apDelClinicPhoto=function(){const ad=loadAD();delete ad.clinicPhoto;saveAD(ad);updateClinicPhotoDisplay();switchTab('content',null);doSync();};
 window.apAddGal=function(inp){
   const files=Array.from(inp.files);const ad=loadAD();if(!ad.gallery)ad.gallery=[];
   let n=0;
@@ -2027,7 +2066,7 @@ window.apChangePw=async function(){
 };
 
 // ── INIT ─────────────────────────────────────────────
-renderDates();renderSlots();renderGallery();updateProfileDisplay();applyContentToPage();
+renderDates();renderSlots();renderGallery();updateProfileDisplay();updateClinicPhotoDisplay();applyContentToPage();
 initFromGH();
 
 // ── AUTO-REFRESH — cập nhật slot mỗi 15s (hiển thị booking mới từ bệnh nhân) ──
