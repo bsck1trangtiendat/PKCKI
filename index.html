@@ -1012,7 +1012,8 @@ let isAdmin = sessionStorage.getItem('_adm')==='1';
 const GH_OWNER  = 'bsck1trangtiendat';        // ← GitHub username của bạn  (vd: 'trangtiendat')
 const GH_REPO   = 'PKCKI';        // ← Tên repository            (vd: 'phong-kham')
 const GH_BRANCH = 'main';    // ← Branch (thường là 'main')
-const GH_FILE   = 'data.json'; // ← Tên file dữ liệu
+const GH_FILE   = 'data.json'; // ← Tên file dữ liệu (bookings / content / settings)
+const GH_IMG_FILE='images.json'; // ← File riêng cho ảnh base64 (giữ data.json gọn nhẹ)
 
 // ══════════════════════════════════════════════════════
 // CLOUDFLARE WORKER URL — proxy đặt lịch cho bệnh nhân
@@ -1061,6 +1062,24 @@ let aDate = fmtK(new Date()), pending = null;
 function fmtK(d){return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}`}
 function z(n){return String(n).padStart(2,'0')}
 function genId(){return Math.random().toString(36).substr(2,9)+Date.now().toString(36)}
+
+// ── IMAGE COMPRESSION ────────────────────────────────
+// Resize + re-encode trước khi lưu → tránh base64 khổng lồ vào storage / GitHub
+async function compressImage(dataUrl, maxPx=1200, quality=0.82){
+  return new Promise(resolve=>{
+    const img=new Image();
+    img.onload=()=>{
+      const scale=Math.min(1, maxPx/Math.max(img.width||1, img.height||1));
+      const c=document.createElement('canvas');
+      c.width=Math.round(img.width*scale);
+      c.height=Math.round(img.height*scale);
+      c.getContext('2d').drawImage(img,0,0,c.width,c.height);
+      resolve(c.toDataURL('image/jpeg', quality));
+    };
+    img.onerror=()=>resolve(dataUrl); // fallback: dùng ảnh gốc nếu lỗi
+    img.src=dataUrl;
+  });
+}
 
 // ── DATA LAYER ───────────────────────────────────────
 function loadBK(){try{return JSON.parse(localStorage.getItem(BK)||'{}')}catch{return{}}}
@@ -1177,13 +1196,88 @@ async function ghPushData(payload){
 }
 
 function buildGHPayload(){
+  // ⚠️ FIX: Loại bỏ các trường base64 khổng lồ khỏi data.json.
+  // profilePhoto / clinicPhoto / gallery được lưu riêng trong images.json
+  // để Worker đọc data.json không bị lỗi parse do file quá lớn.
+  const {profilePhoto:_pp, clinicPhoto:_cp, gallery:_gl, ...adminDataClean}=loadAD();
   return {
     bookings  : loadBK(),
-    adminData : loadAD(),
+    adminData : adminDataClean,
     content   : loadCT(),
-    adminHash : localStorage.getItem(AH)||null,   // ← đồng bộ mật khẩu admin
+    adminHash : localStorage.getItem(AH)||null,
     updatedAt : new Date().toISOString()
   };
+}
+
+// ── IMAGES.JSON — file riêng cho ảnh base64 ──────────
+function buildImagesPayload(){
+  const ad=loadAD();
+  const p={updatedAt:new Date().toISOString()};
+  if(ad.profilePhoto) p.profilePhoto=ad.profilePhoto;
+  if(ad.clinicPhoto)  p.clinicPhoto=ad.clinicPhoto;
+  if(ad.gallery&&ad.gallery.length) p.gallery=ad.gallery;
+  return p;
+}
+
+async function ghGetImgSha(){
+  const c=ghCfgResolved();
+  if(!c.owner||!c.repo||!c.token) return null;
+  try{
+    const r=await fetch(
+      `https://api.github.com/repos/${c.owner}/${c.repo}/contents/${GH_IMG_FILE}?ref=${c.branch}`,
+      {headers:{'Authorization':`Bearer ${c.token}`,'Accept':'application/vnd.github.v3+json'}}
+    );
+    if(!r.ok) return null;
+    return (await r.json()).sha||null;
+  }catch{return null;}
+}
+
+async function syncImagesToGH(statusCb){
+  const c=ghCfgResolved();
+  if(!c.owner||!c.repo||!c.token) return {ok:false,msg:'Chưa có token'};
+  if(statusCb) statusCb('loading','⏳ Đang lưu ảnh lên GitHub…');
+  const sha=await ghGetImgSha();
+  const payload=buildImagesPayload();
+  const content=btoa(unescape(encodeURIComponent(JSON.stringify(payload,null,2))));
+  const body={message:`Cập nhật ảnh ${new Date().toLocaleString('vi-VN')}`,content,branch:c.branch};
+  if(sha) body.sha=sha;
+  try{
+    const r=await fetch(
+      `https://api.github.com/repos/${c.owner}/${c.repo}/contents/${GH_IMG_FILE}`,
+      {method:'PUT',headers:{'Authorization':`Bearer ${c.token}`,'Accept':'application/vnd.github.v3+json','Content-Type':'application/json'},
+       body:JSON.stringify(body)}
+    );
+    if(r.ok){if(statusCb)statusCb('ok','✅ Ảnh đã lưu lên GitHub!');return{ok:true};}
+    const e=await r.json().catch(()=>({}));
+    const msg=`❌ Lỗi lưu ảnh ${r.status}: ${e.message||''}`;
+    if(statusCb)statusCb('err',msg);
+    return{ok:false,msg};
+  }catch(e){
+    const msg=`❌ Lỗi kết nối: ${e.message}`;
+    if(statusCb)statusCb('err',msg);
+    return{ok:false,msg};
+  }
+}
+
+async function ghFetchImages(){
+  const c=ghCfgResolved();
+  if(!c.owner||!c.repo) return null;
+  try{
+    if(c.token){
+      const r=await fetch(
+        `https://api.github.com/repos/${c.owner}/${c.repo}/contents/${GH_IMG_FILE}?ref=${c.branch}`,
+        {headers:{'Authorization':`Bearer ${c.token}`,'Accept':'application/vnd.github.v3+json','Cache-Control':'no-cache'}}
+      );
+      if(!r.ok) return null;
+      const d=await r.json();
+      return JSON.parse(decodeURIComponent(escape(atob(d.content.replace(/\n/g,'')))));
+    }
+    // Fallback public raw URL (bệnh nhân không có token vẫn load được gallery)
+    const url=`https://raw.githubusercontent.com/${c.owner}/${c.repo}/${c.branch}/${GH_IMG_FILE}?_=${Date.now()}`;
+    const r=await fetch(url);
+    if(!r.ok) return null;
+    return await r.json();
+  }catch{return null;}
 }
 
 // Chỉ merge bookings từ GH vào local (không ghi đè content / adminData local)
@@ -1281,14 +1375,15 @@ function applyGHData(ghData){
     saveBK(merged);
   }
 
-  // ── Admin data (ảnh, gallery) ──
+  // ── Admin data (không có ảnh — ảnh nằm trong images.json) ──
   if(ghData.adminData && typeof ghData.adminData==='object'){
     const local=loadAD();
-    // ⚠️ FIX: Bảo vệ ảnh local nếu GH không có (push thất bại do ảnh quá lớn)
     const merged=Object.assign({},ghData.adminData);
-    if(!merged.profilePhoto && local.profilePhoto) merged.profilePhoto=local.profilePhoto;
-    if(!merged.clinicPhoto && local.clinicPhoto) merged.clinicPhoto=local.clinicPhoto;
-    if((!merged.gallery||!merged.gallery.length) && local.gallery && local.gallery.length) merged.gallery=local.gallery;
+    // Ảnh base64 LUÔN được bảo toàn từ local (nguồn sự thật là images.json,
+    // không phải data.json — data.json đã không còn chứa ảnh sau khi fix).
+    if(local.profilePhoto) merged.profilePhoto=local.profilePhoto;
+    if(local.clinicPhoto)  merged.clinicPhoto=local.clinicPhoto;
+    if(local.gallery&&local.gallery.length) merged.gallery=local.gallery;
     saveAD(merged);
   }
 
@@ -1309,21 +1404,26 @@ function applyGHData(ghData){
   }
 }
 
-// Khởi tạo: tải từ GitHub khi vào trang
+// Khởi tạo: tải song song data.json + images.json từ GitHub
 async function initFromGH(){
-  const data=await ghFetchData();
-  if(data){
-    applyGHData(data);
-    applyContentToPage();
-    renderGallery();
-    updateProfileDisplay();
-    updateClinicPhotoDisplay();
-    renderSlots();
-    // Nếu admin panel đang mở → cập nhật lại tab hiện tại để hiển thị booking mới
-    const ap=document.getElementById('admin-panel');
-    if(isAdmin && ap && !ap.classList.contains('hidden')){
-      switchTab(curTab, null);
-    }
+  const [data, imgData]=await Promise.all([ghFetchData(), ghFetchImages()]);
+  if(data) applyGHData(data);  // merge bookings / content / settings
+  if(imgData){
+    // Ghi đè ảnh từ images.json vào adminData local
+    const ad=loadAD();
+    if(imgData.profilePhoto) ad.profilePhoto=imgData.profilePhoto;
+    if(imgData.clinicPhoto)  ad.clinicPhoto=imgData.clinicPhoto;
+    if(imgData.gallery&&imgData.gallery.length) ad.gallery=imgData.gallery;
+    saveAD(ad);
+  }
+  applyContentToPage();
+  renderGallery();
+  updateProfileDisplay();
+  updateClinicPhotoDisplay();
+  renderSlots();
+  const ap=document.getElementById('admin-panel');
+  if(isAdmin && ap && !ap.classList.contains('hidden')){
+    switchTab(curTab, null);
   }
 }
 
@@ -1929,28 +2029,54 @@ window.apClearHistory=function(){
 window.apSetPhoto=function(inp){
   const file=inp.files[0];if(!file)return;
   const r=new FileReader();
-  r.onload=e=>{const ad=loadAD();ad.profilePhoto=e.target.result;saveAD(ad);updateProfileDisplay();switchTab('profile',null);doSync();};
+  r.onload=async e=>{
+    const data=await compressImage(e.target.result, 800, 0.82); // ảnh BS: portrait nhỏ vừa đủ
+    const ad=loadAD();ad.profilePhoto=data;saveAD(ad);
+    updateProfileDisplay();switchTab('profile',null);
+    doSync();syncImagesToGH(null);
+  };
   r.readAsDataURL(file);
 };
-window.apDelPhoto=function(){const ad=loadAD();delete ad.profilePhoto;saveAD(ad);updateProfileDisplay();switchTab('profile',null);doSync();};
+window.apDelPhoto=function(){
+  const ad=loadAD();delete ad.profilePhoto;saveAD(ad);
+  updateProfileDisplay();switchTab('profile',null);
+  doSync();syncImagesToGH(null);
+};
 window.apSetClinicPhoto=function(inp){
   const file=inp.files[0];if(!file)return;
   const r=new FileReader();
-  r.onload=e=>{const ad=loadAD();ad.clinicPhoto=e.target.result;saveAD(ad);updateClinicPhotoDisplay();switchTab('profile',null);doSync();};
+  r.onload=async e=>{
+    const data=await compressImage(e.target.result, 1600, 0.80); // ảnh phòng khám: landscape rộng hơn
+    const ad=loadAD();ad.clinicPhoto=data;saveAD(ad);
+    updateClinicPhotoDisplay();switchTab('profile',null);
+    doSync();syncImagesToGH(null);
+  };
   r.readAsDataURL(file);
 };
-window.apDelClinicPhoto=function(){const ad=loadAD();delete ad.clinicPhoto;saveAD(ad);updateClinicPhotoDisplay();switchTab('profile',null);doSync();};
+window.apDelClinicPhoto=function(){
+  const ad=loadAD();delete ad.clinicPhoto;saveAD(ad);
+  updateClinicPhotoDisplay();switchTab('profile',null);
+  doSync();syncImagesToGH(null);
+};
 window.apAddGal=function(inp){
   const files=Array.from(inp.files);const ad=loadAD();if(!ad.gallery)ad.gallery=[];
   let n=0;
   files.forEach(file=>{
     const r=new FileReader();
-    r.onload=e=>{ad.gallery.push({data:e.target.result,id:genId()});n++;
-      if(n===files.length){saveAD(ad);renderGallery();switchTab('gallery',null);doSync();}};
+    r.onload=async e=>{
+      const data=await compressImage(e.target.result, 1200, 0.80);
+      ad.gallery.push({data,id:genId()});n++;
+      if(n===files.length){saveAD(ad);renderGallery();switchTab('gallery',null);doSync();syncImagesToGH(null);}
+    };
     r.readAsDataURL(file);
   });
 };
-window.apDelGal=function(idx){const ad=loadAD();if(!ad.gallery)return;ad.gallery.splice(idx,1);saveAD(ad);renderGallery();switchTab('gallery',null);doSync();};
+window.apDelGal=function(idx){
+  const ad=loadAD();if(!ad.gallery)return;
+  ad.gallery.splice(idx,1);saveAD(ad);
+  renderGallery();switchTab('gallery',null);
+  doSync();syncImagesToGH(null);
+};
 
 // ─────────────────────────────────────────────────────
 // CONTENT TAB ACTIONS
@@ -2035,13 +2161,16 @@ window.ghTestConn=async function(){
 };
 window.ghSyncNow=async function(){
   const sb=document.getElementById('gh-status-box');
-  // Lưu token nếu user vừa nhập
   const tokenInput=document.getElementById('gh-token');
   if(tokenInput&&tokenInput.value.trim()){
     const old=loadGHCfg();saveGHCfg(Object.assign({},old,{token:tokenInput.value.trim()}));
   }
   const cb=(state,msg)=>{sb.className=`gh-status ${state}`;sb.textContent=msg;sb.style.display='block';};
-  await syncToGH(cb);
+  // Đồng bộ song song: data.json (bookings/content) + images.json (ảnh base64)
+  const [r1, r2]=await Promise.all([syncToGH(null), syncImagesToGH(null)]);
+  if(r1.ok&&r2.ok) cb('ok','✅ Đồng bộ thành công (data + ảnh)!');
+  else if(r1.ok)   cb('ok',`✅ data.json OK · ${r2.msg||'ảnh: lỗi nhỏ'}`);
+  else             cb('err', r1.msg||'❌ Lỗi đồng bộ');
 };
 window.apChangePw=async function(){
   const oldPw=document.getElementById('pw-old').value;
