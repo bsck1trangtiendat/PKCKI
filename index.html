@@ -1003,6 +1003,9 @@ if(typeof emailjs!=='undefined'&&EJS_PUB!=='YOUR_PUBLIC_KEY')
 
 // ── ADMIN CONFIG (mật khẩu lưu dạng SHA-256 hash, không hiển thị plaintext) ──
 let isAdmin = sessionStorage.getItem('_adm')==='1';
+// PII cache — chỉ sống trong RAM, KHÔNG lưu localStorage
+// Được điền bởi workerFetchBookings() khi admin mở panel
+let _adminBk = null;
 
 // ══════════════════════════════════════════════════════
 // ĐIỀN THÔNG TIN GITHUB CỦA BẠN VÀO ĐÂY (bắt buộc)
@@ -1036,6 +1039,7 @@ const AH = 'pk_ah5';   // admin hash
 const WK = 'pk_wk5';   // worker url
 const DL = 'pk_dl5';   // deleted booking IDs (tránh GH restore)
 const CL = 'pk_cl5';   // timestamp lần xóa toàn bộ
+const AS = 'pk_as5';   // admin secret key (xác thực Worker admin GET/POST)
 
 // ── SHA-256 HASH ─────────────────────────────────────
 async function sha256(str){
@@ -1099,6 +1103,73 @@ function addDeletedIds(ids){
 }
 function getLastClearTime(){return parseInt(localStorage.getItem(CL)||'0')}
 
+// ── Admin Secret (Worker v2 auth) ──────────────────────────────
+function loadAdminSecret(){return localStorage.getItem(AS)||''}
+function saveAdminSecret(s){if(s)localStorage.setItem(AS,s);else localStorage.removeItem(AS)}
+
+// Convert Worker public {slots} → bookings format để renderSlots() dùng được
+// Chỉ chứa status, KHÔNG có PII (tên/SĐT/ghi chú)
+function slotsToBookings(slots){
+  const bk={};
+  for(const[date,times] of Object.entries(slots||{})){
+    bk[date]={};
+    for(const[time,status] of Object.entries(times||{})){
+      if(status&&status!=='none'){
+        bk[date][time]=[{id:'_remote',status,name:'',phone:'',note:'',at:''}];
+      }
+    }
+  }
+  return bk;
+}
+
+// Admin: fetch full bookings (với PII) từ Worker v2 qua X-Admin-Key
+async function workerFetchBookings(){
+  const wkUrl=getWorkerUrl();
+  if(!wkUrl||wkUrl==='YOUR_WORKER_URL') return null;
+  const secret=loadAdminSecret();
+  if(!secret){
+    console.warn('[Worker v2] Admin secret chưa cấu hình — vào ⚙️ Cài đặt → Admin Secret Key');
+    return null;
+  }
+  try{
+    const r=await fetch(wkUrl,{headers:{'Accept':'application/json','X-Admin-Key':secret}});
+    if(!r.ok) return null;
+    const d=await r.json();
+    return d.ok?d:null;
+  }catch(e){console.error('[Worker v2] fetch bookings error:',e);return null;}
+}
+
+// Gọi Worker v2 admin action (setStatus / deleteBooking / sync / migrate / clearAllSlots)
+async function workerAdminAction(body){
+  const wkUrl=getWorkerUrl();
+  const secret=loadAdminSecret();
+  if(!wkUrl||wkUrl==='YOUR_WORKER_URL'||!secret){
+    return {ok:false,msg:'Chưa cấu hình Worker URL hoặc Admin Secret Key (⚙️ Cài đặt)'};
+  }
+  try{
+    const r=await fetch(wkUrl,{
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-Admin-Key':secret},
+      body:JSON.stringify({_admin:true,...body})
+    });
+    return await r.json().catch(()=>({ok:false,msg:'Phản hồi không hợp lệ từ Worker'}));
+  }catch(e){return {ok:false,msg:e.message};}
+}
+
+// Cập nhật status trong _adminBk (RAM) và localStorage sau admin action
+function updateAdminBkStatus(date,time,id,status){
+  if(_adminBk&&_adminBk[date]&&_adminBk[date][time]){
+    const b=_adminBk[date][time].find(b=>b.id===id);
+    if(b) b.status=status;
+  }
+  const bk=loadBK();
+  if(bk[date]&&bk[date][time]){
+    const b=(bk[date][time]||[]).find(b=>b.id===id);
+    if(b) b.status=status;
+    saveBK(bk);
+  }
+}
+
 // Lấy Worker URL: localStorage ưu tiên, fallback sang hằng số
 function getWorkerUrl(){return localStorage.getItem(WK)||WORKER_URL||''}
 
@@ -1127,7 +1198,8 @@ async function ghFetchData(){
   const c=ghCfgResolved();
   if(!c.owner||!c.repo) return null;
   try{
-    // ── Khi có token: dùng GitHub API (không bị CDN cache) → luôn lấy dữ liệu mới nhất ──
+    // ── Admin (có token): đọc qua GitHub API ──
+    // data.json giờ chỉ còn slots status + content (không có PII bệnh nhân)
     if(c.token){
       const r=await fetch(
         `https://api.github.com/repos/${c.owner}/${c.repo}/contents/${c.file}?ref=${c.branch}`,
@@ -1140,13 +1212,27 @@ async function ghFetchData(){
       );
       return JSON.parse(raw);
     }
-    // ── Fallback (bệnh nhân không có token): raw URL ──
-    // raw.githubusercontent.com có thể trễ cache vài phút, nhưng bệnh nhân
-    // chỉ cần đọc slot hiển thị; Worker validate thực tế phía server.
-    const url=`https://raw.githubusercontent.com/${c.owner}/${c.repo}/${c.branch}/${c.file}?_=${Date.now()}`;
-    const r=await fetch(url);
-    if(!r.ok) return null;
-    return await r.json();
+    // ── Bệnh nhân (không có token): đọc qua Worker v2 GET ──
+    // Worker trả về {ok, slots, content} — không có PII
+    // KHÔNG còn fallback raw.githubusercontent.com (đã xóa để bảo vệ dữ liệu)
+    const wkUrl=getWorkerUrl();
+    if(wkUrl&&wkUrl!=='YOUR_WORKER_URL'){
+      try{
+        const r=await fetch(wkUrl,{headers:{'Accept':'application/json'}});
+        if(!r.ok) return null;
+        const d=await r.json();
+        if(d.ok&&d.slots){
+          // Worker trả về {slots, content} → bổ sung bookings (chỉ status, không PII)
+          return {
+            slots   : d.slots,
+            bookings: slotsToBookings(d.slots),
+            content : d.content||{},
+            updatedAt:d.updatedAt
+          };
+        }
+      }catch(e){console.warn('[ghFetchData] Worker GET lỗi:',e);return null;}
+    }
+    return null; // Không còn fallback raw URL
   }catch{return null;}
 }
 
@@ -1195,13 +1281,28 @@ async function ghPushData(payload){
   return {ok:false,msg:'❌ Không thể ghi lên GitHub sau nhiều lần thử.'};
 }
 
-function buildGHPayload(){
-  // ⚠️ FIX: Loại bỏ các trường base64 khổng lồ khỏi data.json.
-  // profilePhoto / clinicPhoto / gallery được lưu riêng trong images.json
-  // để Worker đọc data.json không bị lỗi parse do file quá lớn.
-  const {profilePhoto:_pp, clinicPhoto:_cp, gallery:_gl, ...adminDataClean}=loadAD();
+function buildGHPayload(existingSlots){
+  // ── Bảo vệ dữ liệu: data.json CHỈ lưu slots status (không có PII) ──
+  // PII bệnh nhân (tên, SĐT, ghi chú) được Worker v2 lưu riêng trong KV.
+  // existingSlots: slots đang có trên server — ưu tiên dùng để tránh ghi đè
+  // Nếu không có existingSlots, build từ localStorage (cho case sync content/settings)
+  const slots = existingSlots || (()=>{
+    const bk=loadBK(), s={};
+    for(const[date,times] of Object.entries(bk)){
+      s[date]={};
+      for(const[time,bks] of Object.entries(times||{})){
+        const hasAcc=(bks||[]).some(b=>b.status==='accepted');
+        const hasPend=(bks||[]).some(b=>b.status==='pending');
+        const st=hasAcc?'accepted':hasPend?'pending':null;
+        if(st) s[date][time]=st;
+      }
+      if(!Object.keys(s[date]).length) delete s[date];
+    }
+    return s;
+  })();
+  const {profilePhoto:_pp,clinicPhoto:_cp,gallery:_gl,...adminDataClean}=loadAD();
   return {
-    bookings  : loadBK(),
+    slots,                                      // ← Không có PII
     adminData : adminDataClean,
     content   : loadCT(),
     adminHash : localStorage.getItem(AH)||null,
@@ -1322,29 +1423,57 @@ function applyGHBookingsOnly(ghBk){
 }
 
 async function syncToGH(statusCb){
-  if(statusCb) statusCb('loading','⏳ Đang lấy dữ liệu mới nhất từ GitHub…');
-  // Fetch-merge-push: lấy booking mới nhất từ GH (bệnh nhân đặt qua Worker)
-  // trước khi push để tránh ghi đè
+  // Worker v2: chỉ sync content/adminData/adminHash lên GitHub.
+  // Slots do Worker quản lý — đọc slots hiện tại từ server để giữ nguyên.
+  if(statusCb) statusCb('loading','⏳ Đang lấy slot status từ server…');
   const ghData=await ghFetchData();
-  if(ghData&&ghData.bookings) applyGHBookingsOnly(ghData.bookings);
+  const currentSlots=(ghData&&ghData.slots)||{};
   if(statusCb) statusCb('loading','⏳ Đang lưu lên GitHub…');
-  const r=await ghPushData(buildGHPayload());
+  const r=await ghPushData(buildGHPayload(currentSlots));
   if(statusCb) statusCb(r.ok?'ok':'err', r.msg);
   return r;
 }
 
-// Áp dụng data từ GitHub vào localStorage
+// Áp dụng data từ GitHub / Worker vào localStorage
 function applyGHData(ghData){
   if(!ghData) return;
 
-  // ── Bookings: merge GH (booking mới từ thiết bị khác) + local (nguồn sự thật cho STATUS) ──
-  // ⚠️ FIX: lọc bỏ booking đã xóa / đã clear trước khi merge (giống applyGHBookingsOnly)
-  if(ghData.bookings && typeof ghData.bookings==='object'){
+  // ── Slots (format mới từ Worker v2): chuyển thành bookings cho renderSlots() ──
+  if(ghData.slots && typeof ghData.slots==='object'){
+    const slotsAsBk=slotsToBookings(ghData.slots);
+    const local=loadBK();
+    // Merge: giữ PII đã có trong local (_adminBk đã sync vào local trước đó)
+    // Chỉ thêm slot entries mà local chưa có
+    for(const d in slotsAsBk){
+      if(!local[d]) local[d]={};
+      for(const t in slotsAsBk[d]){
+        // Nếu local đã có PII thật (name != '') thì giữ nguyên, chỉ update status
+        const localSlot=local[d][t]||[];
+        const hasPII=localSlot.some(b=>b.name);
+        if(!hasPII) local[d][t]=slotsAsBk[d][t];
+        else {
+          // Update status từ server nhưng giữ PII
+          const remoteStatus=slotsAsBk[d][t][0]?.status;
+          if(remoteStatus) localSlot.forEach(b=>{if(b.id==='_remote'||!b.name)b.status=remoteStatus;});
+        }
+      }
+    }
+    // Overlay _adminBk PII nếu có (nguồn sự thật cho PII)
+    if(_adminBk){
+      for(const d in _adminBk){
+        if(!local[d]) local[d]={};
+        for(const t in _adminBk[d]) local[d][t]=_adminBk[d][t];
+      }
+    }
+    saveBK(local);
+  }
+
+  // ── Bookings (format cũ — compatibility / migration period) ─
+  if(ghData.bookings && typeof ghData.bookings==='object' && !ghData.slots){
     const local=loadBK();
     const deletedIds=loadDeleted();
     const clearedBefore=getLastClearTime();
     const merged=JSON.parse(JSON.stringify(ghData.bookings));
-    // Lọc booking đã bị admin xóa khỏi GH data trước khi merge
     for(const d in merged){
       for(const t in merged[d]){
         merged[d][t]=(merged[d][t]||[]).filter(b=>{
@@ -1359,16 +1488,13 @@ function applyGHData(ghData){
     for(const d in local){
       if(!merged[d]) merged[d]={};
       for(const t in local[d]){
-        if(!merged[d][t]){
-          merged[d][t]=local[d][t];
-        } else {
+        if(!merged[d][t]){ merged[d][t]=local[d][t]; }
+        else{
           const localMap={};
           (local[d][t]||[]).forEach(b=>localMap[b.id]=b);
           merged[d][t]=(merged[d][t]||[]).map(b=>localMap[b.id]||b);
           const ghIds=new Set((merged[d][t]||[]).map(b=>b.id));
-          for(const bk of (local[d][t]||[])){
-            if(!ghIds.has(bk.id)) merged[d][t].push(bk);
-          }
+          for(const bk of (local[d][t]||[])){if(!ghIds.has(bk.id))merged[d][t].push(bk);}
         }
       }
     }
@@ -1379,8 +1505,6 @@ function applyGHData(ghData){
   if(ghData.adminData && typeof ghData.adminData==='object'){
     const local=loadAD();
     const merged=Object.assign({},ghData.adminData);
-    // Ảnh base64 LUÔN được bảo toàn từ local (nguồn sự thật là images.json,
-    // không phải data.json — data.json đã không còn chứa ảnh sau khi fix).
     if(local.profilePhoto) merged.profilePhoto=local.profilePhoto;
     if(local.clinicPhoto)  merged.clinicPhoto=local.clinicPhoto;
     if(local.gallery&&local.gallery.length) merged.gallery=local.gallery;
@@ -1389,27 +1513,21 @@ function applyGHData(ghData){
 
   // ── Nội dung trang ──
   if(ghData.content && typeof ghData.content==='object'){
-    // ⚠️ FIX: Merge GH content vào local (không ghi đè hoàn toàn → tránh mất nội dung chưa sync)
     saveCT(Object.assign({},loadCT(),ghData.content));
   }
 
-  // ── Mật khẩu admin: GH là nguồn sự thật ──
-  // Chỉ áp dụng nếu GH có hash (không ghi đè khi admin đang đăng nhập)
+  // ── Hash mật khẩu admin ──
   if(ghData.adminHash && typeof ghData.adminHash==='string'){
     const localHash=localStorage.getItem(AH);
-    // Cập nhật nếu local chưa có hash, hoặc GH hash khác (admin đã đổi mật khẩu từ thiết bị khác)
-    if(!localHash || localHash!==ghData.adminHash){
-      localStorage.setItem(AH, ghData.adminHash);
-    }
+    if(!localHash||localHash!==ghData.adminHash) localStorage.setItem(AH,ghData.adminHash);
   }
 }
 
-// Khởi tạo: tải song song data.json + images.json từ GitHub
+// Khởi tạo: tải song song data.json (slot status) + images.json từ GitHub/Worker
 async function initFromGH(){
   const [data, imgData]=await Promise.all([ghFetchData(), ghFetchImages()]);
-  if(data) applyGHData(data);  // merge bookings / content / settings
+  if(data) applyGHData(data);
   if(imgData){
-    // Ghi đè ảnh từ images.json vào adminData local
     const ad=loadAD();
     if(imgData.profilePhoto) ad.profilePhoto=imgData.profilePhoto;
     if(imgData.clinicPhoto)  ad.clinicPhoto=imgData.clinicPhoto;
@@ -1421,10 +1539,26 @@ async function initFromGH(){
   updateProfileDisplay();
   updateClinicPhotoDisplay();
   renderSlots();
-  const ap=document.getElementById('admin-panel');
-  if(isAdmin && ap && !ap.classList.contains('hidden')){
-    switchTab(curTab, null);
+  // Admin: tải PII từ Worker v2 sau khi UI đã render (không block trang)
+  if(isAdmin){
+    workerFetchBookings().then(result=>{
+      if(!result||!result.bookings) return;
+      _adminBk=result.bookings;
+      // Sync PII vào localStorage để admin actions hoạt động
+      const bk=loadBK();
+      for(const d in _adminBk){
+        if(!bk[d]) bk[d]={};
+        for(const t in _adminBk[d]) bk[d][t]=_adminBk[d][t];
+      }
+      saveBK(bk);
+      renderSlots();
+      // Re-render panel nếu đang mở
+      const ap=document.getElementById('admin-panel');
+      if(ap&&!ap.classList.contains('hidden')) switchTab(curTab,null);
+    });
   }
+  const ap=document.getElementById('admin-panel');
+  if(isAdmin&&ap&&!ap.classList.contains('hidden')) switchTab(curTab,null);
 }
 
 // Áp dụng nội dung đã chỉnh sửa lên trang
@@ -1678,16 +1812,26 @@ if(isAdmin)document.getElementById('admin-badge').classList.remove('hidden');
 function openAdminPanel(){
   switchTab(curTab,null);
   document.getElementById('admin-panel').classList.remove('hidden');
-  // Tải dữ liệu mới nhất từ GitHub ngay khi mở panel (không đợi auto-refresh 15s)
+  // Tải song song: slot status từ GitHub + PII từ Worker v2
   (async()=>{
-    const data=await ghFetchData();
-    if(data&&data.bookings){
-      const before=JSON.stringify(loadBK());
-      applyGHBookingsOnly(data.bookings);
+    const [data, wkResult]=await Promise.all([
+      ghFetchData(),
+      workerFetchBookings()
+    ]);
+    // 1. Cập nhật slot status từ GitHub
+    if(data){ applyGHData(data); renderSlots(); }
+    // 2. Overlay PII từ Worker (không lưu PII vào GitHub)
+    if(wkResult&&wkResult.bookings){
+      _adminBk=wkResult.bookings;
+      const bk=loadBK();
+      for(const d in _adminBk){
+        if(!bk[d]) bk[d]={};
+        for(const t in _adminBk[d]) bk[d][t]=_adminBk[d][t];
+      }
+      saveBK(bk);
       renderSlots();
-      // Chỉ re-render panel nếu có booking mới (tránh nhấp nháy không cần thiết)
-      if(JSON.stringify(loadBK())!==before) switchTab(curTab,null);
     }
+    switchTab(curTab,null);
   })();
 }
 window.closeAdminPanel=function(){document.getElementById('admin-panel').classList.add('hidden');};
@@ -1948,12 +2092,43 @@ window.switchTab=function(tab,btn){
         </div>
         <div id="wk-status-box" class="gh-status" style="display:none"></div>
         <div style="margin-top:10px;padding:10px;background:rgba(0,184,174,.06);border:1px solid rgba(0,184,174,.18);border-radius:10px;font-size:10px;color:var(--ts);line-height:1.7">
-          <strong>Hướng dẫn nhanh (5 phút):</strong><br>
-          1. Đăng ký miễn phí tại <a href="https://workers.cloudflare.com" target="_blank" style="color:var(--a)">workers.cloudflare.com</a><br>
-          2. Tạo Worker mới → dán nội dung file <strong>worker.js</strong> vào editor<br>
-          3. Vào <em>Settings → Variables</em> → thêm secret <code>GITHUB_TOKEN</code> = PAT của bạn<br>
-          4. Deploy → copy URL → dán vào ô trên → nhấn <strong>Lưu Worker URL</strong>
+          <strong>Hướng dẫn Worker v2 (cập nhật 1 lần):</strong><br>
+          1. Vào <a href="https://workers.cloudflare.com" target="_blank" style="color:var(--a)">workers.cloudflare.com</a> → KV → tạo namespace <code>BOOKINGS</code><br>
+          2. Vào Worker → Settings → Variables → KV Namespace Bindings → thêm <code>BOOKINGS_KV</code><br>
+          3. Thêm secret <code>ADMIN_SECRET</code> = chuỗi ngẫu nhiên ≥ 32 ký tự<br>
+          4. Thay toàn bộ code Worker bằng <strong>worker.js v2</strong> → Deploy<br>
+          5. Dán <code>ADMIN_SECRET</code> vào ô bên dưới → Lưu → Kiểm tra
         </div>
+
+        <hr class="gh-divider">
+
+        <div class="gh-field">
+          <label class="gh-label">🔑 Admin Secret Key — xác thực admin với Worker v2</label>
+          <input class="gh-input" id="admin-secret-key" type="password"
+            placeholder="Dán giá trị ADMIN_SECRET từ Cloudflare vào đây"
+            value="${loadAdminSecret()}">
+          <span style="font-size:10px;color:var(--ts);margin-top:3px;display:block">
+            Khớp với secret <code>ADMIN_SECRET</code> trên Cloudflare Worker. Chỉ lưu trên thiết bị admin.
+            <strong>Bắt buộc</strong> để xem tên/SĐT bệnh nhân và quản lý lịch.
+          </span>
+        </div>
+        <div class="gh-btn-row">
+          <button class="gh-btn gh-btn-primary" onclick="ghSaveAdminSecret()">💾 Lưu Admin Secret</button>
+          <button class="gh-btn gh-btn-secondary" onclick="ghTestAdminKey()">🔌 Kiểm tra</button>
+        </div>
+        <div id="as-status-box" class="gh-status" style="display:none"></div>
+
+        <hr class="gh-divider">
+
+        <div style="padding:10px;background:rgba(255,165,0,.07);border:1px solid rgba(255,165,0,.25);border-radius:10px;font-size:10px;color:var(--ts);line-height:1.7">
+          <strong>🔄 Migration (chạy 1 lần sau khi deploy Worker v2):</strong><br>
+          Nếu data.json cũ vẫn còn thông tin bệnh nhân, nhấn nút dưới để chuyển toàn bộ PII
+          vào Cloudflare KV và làm sạch data.json. Sau migration, repo public sẽ không còn lộ tên/SĐT.
+        </div>
+        <div class="gh-btn-row" style="margin-top:8px">
+          <button class="gh-btn" style="background:rgba(255,140,0,.15);color:#d97706;border:1px solid rgba(255,140,0,.3)" onclick="ghRunMigration()">⚙️ Migrate dữ liệu cũ sang KV</button>
+        </div>
+        <div id="mig-status-box" class="gh-status" style="display:none"></div>
 
         <hr class="gh-divider">
 
@@ -1987,20 +2162,52 @@ function setStatus(date,time,id,status){
     saveBK(bk);
   }
 }
-window.apAccept=function(date,time,id){
-  setStatus(date,time,id,'accepted');renderSlots();switchTab('bookings',null);
-  toast('✅ Đã chấp nhận — slot đã đóng!','ok');doSync();
+// ── Admin booking actions — tất cả đi qua Worker v2 (cập nhật KV + data.json) ──
+window.apAccept=async function(date,time,id){
+  // Cập nhật UI ngay lập tức (optimistic update)
+  updateAdminBkStatus(date,time,id,'accepted');
+  renderSlots();switchTab('bookings',null);
+  toast('⏳ Đang gửi lên server…','loading');
+  const r=await workerAdminAction({action:'setStatus',date,time,id,status:'accepted'});
+  if(r.ok){
+    toast('✅ Đã chấp nhận — slot đã đóng!','ok');
+  } else {
+    // Rollback nếu server lỗi
+    updateAdminBkStatus(date,time,id,'pending');
+    renderSlots();switchTab('bookings',null);
+    toast('❌ Lỗi server: '+(r.msg||'unknown'),'err');
+  }
 };
-window.apDecline=function(date,time,id){
-  setStatus(date,time,id,'declined');renderSlots();switchTab('bookings',null);
-  toast('❌ Đã từ chối lịch này.','err');doSync();
+window.apDecline=async function(date,time,id){
+  updateAdminBkStatus(date,time,id,'declined');
+  renderSlots();switchTab('bookings',null);
+  toast('⏳ Đang gửi lên server…','loading');
+  const r=await workerAdminAction({action:'setStatus',date,time,id,status:'declined'});
+  if(r.ok){
+    toast('❌ Đã từ chối lịch này.','err');
+  } else {
+    updateAdminBkStatus(date,time,id,'pending');
+    renderSlots();switchTab('bookings',null);
+    toast('❌ Lỗi server: '+(r.msg||'unknown'),'err');
+  }
 };
-window.apRestoreBook=function(date,time,id){
-  setStatus(date,time,id,'pending');renderSlots();switchTab('bookings',null);
-  toast('↩ Đã khôi phục về chờ duyệt.','ok');doSync();
+window.apRestoreBook=async function(date,time,id){
+  updateAdminBkStatus(date,time,id,'pending');
+  renderSlots();switchTab('bookings',null);
+  toast('⏳ Đang gửi lên server…','loading');
+  const r=await workerAdminAction({action:'setStatus',date,time,id,status:'pending'});
+  if(r.ok){
+    toast('↩ Đã khôi phục về chờ duyệt.','ok');
+  } else {
+    toast('❌ Lỗi server: '+(r.msg||'unknown'),'err');
+  }
 };
-window.apDeleteBook=function(date,time,id){
+window.apDeleteBook=async function(date,time,id){
   if(!confirm('Xóa lịch này khỏi danh sách?')) return;
+  // Xóa local ngay
+  if(_adminBk&&_adminBk[date]&&_adminBk[date][time]){
+    _adminBk[date][time]=_adminBk[date][time].filter(b=>b.id!==id);
+  }
   const bk=loadBK();
   if(bk[date]&&bk[date][time]){
     bk[date][time]=bk[date][time].filter(b=>b.id!==id);
@@ -2008,19 +2215,30 @@ window.apDeleteBook=function(date,time,id){
     if(!Object.keys(bk[date]||{}).length) delete bk[date];
     saveBK(bk);
   }
-  addDeletedIds([id]); // ⚠️ FIX: đánh dấu đã xóa → ngăn GH merge phục hồi
+  addDeletedIds([id]);
   renderSlots();switchTab('bookings',null);
-  toast('🗑 Đã xóa lịch.','err');doSync();
+  toast('🗑 Đã xóa lịch.','err');
+  // Đồng bộ lên Worker + GitHub
+  const r=await workerAdminAction({action:'deleteBooking',date,time,id});
+  if(!r.ok) toast('⚠️ Đã xóa local nhưng lỗi sync: '+(r.msg||'unknown'),'err');
 };
-window.apClearHistory=function(){
+window.apClearHistory=async function(){
   if(!confirm('Xóa TOÀN BỘ lịch sử đặt lịch? Không thể hoàn tác!')) return;
-  // ⚠️ FIX: ghi nhớ ID của tất cả booking hiện tại + timestamp clear
+  // Xóa toàn bộ local state
   const bk=loadBK();const allIds=[];
   for(const d in bk) for(const t in bk[d]) for(const b of (bk[d][t]||[])) allIds.push(b.id);
   addDeletedIds(allIds);
-  localStorage.setItem(CL,Date.now().toString()); // mốc thời gian clear
-  saveBK({});renderSlots();switchTab('bookings',null);
-  toast('🗑 Đã xóa toàn bộ lịch sử.','err');doSync();
+  localStorage.setItem(CL,Date.now().toString());
+  saveBK({});_adminBk=null;
+  renderSlots();switchTab('bookings',null);
+  toast('🗑 Đã xóa toàn bộ lịch sử.','err');
+  // Đồng bộ slots rỗng lên Worker + GitHub
+  const {profilePhoto:_pp,clinicPhoto:_cp,gallery:_gl,...adminDataClean}=loadAD();
+  const r=await workerAdminAction({
+    action:'clearAllSlots',
+    data:{content:loadCT(),adminData:adminDataClean,adminHash:localStorage.getItem(AH)||null}
+  });
+  if(!r.ok) toast('⚠️ Đã xóa local nhưng lỗi sync GitHub: '+(r.msg||'unknown'),'err');
 };
 
 // ─────────────────────────────────────────────────────
@@ -2141,6 +2359,59 @@ window.ghTestWorker=async function(){
     }
   }catch(err){sb.className='gh-status err';sb.textContent=`❌ Lỗi kết nối tới Worker: ${err.message}`;sb.style.display='block';}
 };
+// ── Admin Secret Key ──────────────────────────────────
+window.ghSaveAdminSecret=function(){
+  const key=(document.getElementById('admin-secret-key')||{}).value?.trim()||'';
+  const sb=document.getElementById('as-status-box');
+  if(!key){sb.className='gh-status err';sb.textContent='❌ Vui lòng nhập Admin Secret Key.';sb.style.display='block';return;}
+  saveAdminSecret(key);
+  sb.className='gh-status ok';sb.textContent='✅ Đã lưu Admin Secret Key! Reload trang để áp dụng.';sb.style.display='block';
+};
+window.ghTestAdminKey=async function(){
+  const sb=document.getElementById('as-status-box');
+  sb.className='gh-status loading';sb.textContent='⏳ Đang xác thực với Worker…';sb.style.display='block';
+  const key=(document.getElementById('admin-secret-key')||{}).value?.trim()||loadAdminSecret();
+  const wkUrl=getWorkerUrl();
+  if(!wkUrl||wkUrl==='YOUR_WORKER_URL'){sb.className='gh-status err';sb.textContent='❌ Chưa có Worker URL!';sb.style.display='block';return;}
+  if(!key){sb.className='gh-status err';sb.textContent='❌ Chưa nhập Admin Secret Key!';sb.style.display='block';return;}
+  try{
+    const r=await fetch(wkUrl,{headers:{'Accept':'application/json','X-Admin-Key':key}});
+    const d=await r.json().catch(()=>({}));
+    if(r.ok&&d.ok){
+      const kvOk=d.bookings!==undefined; // admin GET thành công
+      sb.className='gh-status ok';
+      sb.textContent=`✅ Xác thực thành công! Worker nhận ra Admin Secret${kvOk?' + đọc được KV.':'.'}`;
+    } else {
+      sb.className='gh-status err';
+      sb.textContent='❌ Worker từ chối key — kiểm tra lại giá trị ADMIN_SECRET trên Cloudflare.';
+    }
+  }catch(e){sb.className='gh-status err';sb.textContent=`❌ Lỗi kết nối: ${e.message}`;sb.style.display='block';}
+};
+// ── Migration: chuyển PII từ data.json cũ → KV ───────
+window.ghRunMigration=async function(){
+  const sb=document.getElementById('mig-status-box');
+  sb.className='gh-status loading';sb.textContent='⏳ Đang đọc data.json cũ…';sb.style.display='block';
+  // Đọc data.json trực tiếp qua GitHub API (cần token)
+  const c=ghCfgResolved();
+  if(!c.token){sb.className='gh-status err';sb.textContent='❌ Cần token GitHub để đọc data cũ.';return;}
+  const r=await fetch(`https://api.github.com/repos/${c.owner}/${c.repo}/contents/${c.file}?ref=${c.branch}`,
+    {headers:{'Authorization':`Bearer ${c.token}`,'Accept':'application/vnd.github.v3+json'}});
+  if(!r.ok){sb.className='gh-status err';sb.textContent=`❌ Không đọc được data.json (${r.status}).`;return;}
+  const d=await r.json();
+  const raw=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(d.content.replace(/\n/g,'')),ch=>ch.charCodeAt(0))));
+  if(!raw.bookings||Object.keys(raw.bookings).length===0){
+    sb.className='gh-status ok';sb.textContent='✅ data.json không có PII cũ — không cần migration!';return;
+  }
+  sb.textContent='⏳ Đang gửi PII sang KV qua Worker…';
+  const result=await workerAdminAction({action:'migrate',data:{bookings:raw.bookings}});
+  if(result.ok){
+    sb.className='gh-status ok';
+    sb.textContent=`✅ ${result.msg} Kiểm tra data.json trên GitHub — không còn tên/SĐT bệnh nhân.`;
+  } else {
+    sb.className='gh-status err';sb.textContent='❌ Migration lỗi: '+(result.msg||'unknown');
+  }
+};
+
 window.ghTestConn=async function(){
   const sb=document.getElementById('gh-status-box');
   sb.className='gh-status loading';sb.textContent='⏳ Đang kiểm tra kết nối…';sb.style.display='block';
@@ -2197,20 +2468,17 @@ renderDates();renderSlots();renderGallery();updateProfileDisplay();updateClinicP
 initFromGH();
 
 // ── AUTO-REFRESH — cập nhật slot mỗi 15s (hiển thị booking mới từ bệnh nhân) ──
+// Auto-refresh mỗi 15 giây: lấy slot status mới nhất từ Worker v2 / GitHub
 setInterval(async()=>{
   const data=await ghFetchData();
-  if(data&&data.bookings){
-    const before=JSON.stringify(loadBK());
-    applyGHBookingsOnly(data.bookings);
-    renderSlots();
-    // Nếu admin đang xem tab bookings → luôn refresh (dù có thay đổi hay không)
-    // để đảm bảo hiển thị đồng bộ với GitHub
-    if(isAdmin&&curTab==='bookings'){
-      const ap=document.getElementById('admin-panel');
-      if(ap&&!ap.classList.contains('hidden')){
-        // Chỉ re-render nếu có thay đổi (tránh nhấp nháy liên tục)
-        if(JSON.stringify(loadBK())!==before) switchTab('bookings',null);
-      }
+  if(!data) return;
+  const before=JSON.stringify(loadBK());
+  applyGHData(data); // xử lý cả format cũ (bookings) lẫn mới (slots)
+  renderSlots();
+  if(isAdmin&&curTab==='bookings'){
+    const ap=document.getElementById('admin-panel');
+    if(ap&&!ap.classList.contains('hidden')&&JSON.stringify(loadBK())!==before){
+      switchTab('bookings',null);
     }
   }
 },15000);
