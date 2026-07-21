@@ -1,7 +1,11 @@
 {
-  "slots": {},
+  "slots": {
+    "2026-07-27": {
+      "19:30": "pending"
+    }
+  },
   "adminData": {},
   "content": {},
   "adminHash": "e9a00e757aa57cda03a996d3988b48db34bf3f05f8ae4d897dcba3f096e7026e",
-  "updatedAt": "2026-07-21T00:59:19.109Z"
+  "updatedAt": "2026-07-21T01:00:29.361Z"
 }
