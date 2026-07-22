@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://bsck1trangtiendat.github.io/PKCKI/sitemap.xml
