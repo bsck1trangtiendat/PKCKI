@@ -1,7 +1,23 @@
 {
   "slots": {},
-  "content": {},
   "adminData": {},
+  "content": {
+    "heroBig1": "CƠ XƯƠNG",
+    "heroBig2": "KHỚP",
+    "heroBig3": "CỘT SỐNG",
+    "heroSub": "BS.CKI Trang Tiến Đạt trực tiếp thăm khám — không uỷ thác. Chuyên Cơ Xương Khớp, Cột Sống & Ngoại Chấn Thương Chỉnh Hình từ BV ĐKTW Cần Thơ.",
+    "docName": "BS.CKI Trang Tiến Đạt",
+    "docBio": "Chuyên gia Cơ Xương Khớp, Cột Sống và Ngoại Chấn Thương Chỉnh Hình. Tốt nghiệp Chuyên khoa I và hiện công tác tại Bệnh viện Đa Khoa Trung Ương Cần Thơ. Phòng khám phục vụ cộng đồng ngoài giờ hành chính với toàn bộ tâm huyết và kinh nghiệm chuyên môn.",
+    "stat1n": "CKI",
+    "stat1l": "Bác sĩ Chuyên khoa INgoại Xương Khớp",
+    "stat2n": "ĐKTW",
+    "stat2l": "Trực tiếp từ BV Đa KhoaTrung Ương Cần Thơ",
+    "stat3n": "100%",
+    "stat3l": "Bác sĩ trực tiếp thăm khámKhông uỷ thác",
+    "bkHint": "Chào mừng trở lại! Đặt lịch nhanh bên dưới.",
+    "trustMsg": "Cam kết không nuôi bệnh — tư vấn trung thực, phác đồ tối ưu, theo dõi đến khi hồi phục hoàn toàn.",
+    "photoCap": "Phòng Khám Ngoại Khoa Trang Tiến Đạt"
+  },
   "adminHash": "e9a00e757aa57cda03a996d3988b48db34bf3f05f8ae4d897dcba3f096e7026e",
-  "updatedAt": "2026-07-22T05:50:25.191Z"
+  "updatedAt": "2026-08-22T09:46:34.322Z"
 }
