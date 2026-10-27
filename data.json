@@ -14,7 +14,7 @@
     "stat2l": "Trực tiếp từ BV Đa KhoaTrung Ương Cần Thơ",
     "stat3n": "100%",
     "stat3l": "Bác sĩ trực tiếp thăm khám Không uỷ thác",
-    "bkHint": "Chào mừng trở lại! Đặt lịch nhanh bên dưới.",
+    "bkHint": "Chào mừng bạn! Đặt lịch nhanh bên dưới.",
     "trustMsg": "Cam kết không nuôi bệnh — tư vấn trung thực, phác đồ tối ưu, theo dõi đến khi hồi phục hoàn toàn.",
     "photoCap": "Phòng Khám Ngoại Khoa Trang Tiến Đạt",
     "ed": {
@@ -24,5 +24,5 @@
     "hide": []
   },
   "adminHash": "e9a00e757aa57cda03a996d3988b48db34bf3f05f8ae4d897dcba3f096e7026e",
-  "updatedAt": "2026-10-27T03:26:11.323Z"
+  "updatedAt": "2026-10-27T03:51:07.943Z"
 }
