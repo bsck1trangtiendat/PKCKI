@@ -1,5 +1,9 @@
 {
-  "slots": {},
+  "slots": {
+    "2026-11-05": {
+      "18:30": "pending"
+    }
+  },
   "adminData": {},
   "content": {
     "heroBig1": "CƠ XƯƠNG",
@@ -26,5 +30,5 @@
     "hide": []
   },
   "adminHash": "e9a00e757aa57cda03a996d3988b48db34bf3f05f8ae4d897dcba3f096e7026e",
-  "updatedAt": "2026-10-31T09:41:53.132Z"
+  "updatedAt": "2026-10-31T09:42:24.020Z"
 }
